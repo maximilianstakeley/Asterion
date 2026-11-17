@@ -300,6 +300,35 @@ def _check_preconditions(candidate: Any) -> bool:
     """Fail closed until a real action-precondition validator is connected."""
     checker = getattr(_safety_gate, "check_preconditions", None)
 
+    decision_metadata = {
+        "architecture": "asterion_intelligence_v1",
+
+        "temporal_model": {
+            "model_id": None,
+            "status": "shadow_or_unavailable"
+        },
+
+        "anomaly_detector": {
+            "version": "robust_temporal_multivariate_v1"
+        },
+
+        "root_cause": {
+            "method": "evidence_ranked_hypotheses_v1"
+        },
+
+        "policy": {
+            "mode": "deterministic",
+            "model_id": None
+        },
+
+        "feature_contract": "asterion_telemetry_features_v1",
+
+        "execution": {
+            "enabled": False,
+            "dry_run": True
+        }
+    }
+
     if not callable(checker):
         logger.warning(
             "No action-precondition checker is configured; failing closed."
