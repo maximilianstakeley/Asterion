@@ -2,7 +2,9 @@
 """Validated observation-to-decision pipeline with fail-closed safety and audit."""
 
 from __future__ import annotations
-
+from .feature_contract import (
+    CONTRACT_VERSION,
+    encode_features,)
 import logging
 import os
 from pathlib import Path
@@ -412,6 +414,8 @@ def analyze(
 
     try:
         normalized_metrics = observation.metrics
+        stage = "feature_encoding"
+        encoded_features = encode_features(normalized_metrics)
 
         if persist_telemetry:
             add_telemetry(
@@ -558,6 +562,8 @@ def analyze(
             observation=_serialize(observation),
             model_outputs={
                 "text_classifier": classification,
+                "telemetry_features": encoded_features.as_dict(),
+                "feature_contract_version": CONTRACT_VERSION,
                 "policy_runtime": policy_runtime,
                 "root_cause_hypotheses": _serialize(hypotheses),
                 "rl_state_mapping": (

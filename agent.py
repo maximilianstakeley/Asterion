@@ -1,6 +1,7 @@
 
 import argparse
 import math
+from .feature_contract import encode_features
 import os
 import socket
 import time
@@ -48,6 +49,22 @@ def _build_structured_observation(observation, agent_id, fallback_host):
 
     if not isinstance(raw_status, dict):
         raise ValueError("Collector metric_status must be a dictionary")
+
+    # Validate the exact five model measurements using the same
+    # contract used by the API policy and RL training environment.
+    model_metrics = {
+        name: metrics[name]["value"]
+        for name in (
+            "cpu_percent",
+            "memory_percent",
+            "disk_percent",
+            "network_connections",
+            "load_1m",)}
+
+    model_features = encode_features(model_metrics)
+    "model_features": model_features.as_dict(),
+
+
 
     metrics = {}
     metric_status = {}
