@@ -1,299 +1,329 @@
 
-"""Validated text classification and deterministic telemetry anomaly detection."""
-
 from __future__ import annotations
 
-import logging
+import json
 import math
-from pathlib import Path
-from typing import Any
+import sqlite3
+import statistics
 
-import joblib
+from datetime import datetime, timezone
 
-from .configuration import MODEL_DIR
+from ..configuration import DB_PATH
 
 
-logger = logging.getLogger(__name__)
-
-MODEL_PATH = MODEL_DIR / "text_classifier.joblib"
-
-# Keep thresholds explicit and reproducible.
-ANOMALY_RULES = (
-    (
-        "cpu_percent",
-        90.0,
-        "high_cpu",
-        "CPU usage is unusually high",
-    ),
-    (
-        "memory_percent",
-        90.0,
-        "high_memory",
-        "Memory usage is unusually high",
-    ),
-    (
-        "disk_percent",
-        95.0,
-        "high_disk",
-        "Disk utilization is near capacity",
-    ),
+FEATURES = (
+    "cpu_percent",
+    "memory_percent",
+    "disk_percent",
+    "load_1m",
+    "network_connections",
 )
 
-HIGH_SEVERITY_MULTIPLIER = 1.15
 
+def metric_value(metrics, name):
+    record = metrics.get(name)
 
-class TextClassifier:
-    """Load and safely query a promoted text-classification pipeline.
-
-    The model artifact must be a trusted joblib file containing a dictionary
-    with a fitted classification pipeline under the key 'pipeline'.
-
-    An unavailable or invalid model does not prevent rule-based anomaly
-    detection from operating.
-    """
-
-    def __init__(self, model_path: Path | str | None = None) -> None:
-        self.model_path = Path(model_path) if model_path is not None else MODEL_PATH
-        self.pipeline: Any | None = None
-        self.load_error: str | None = None
-
-        self._load_model()
-
-    def _load_model(self) -> None:
-        """Load and validate the classifier artifact."""
-        if not self.model_path.is_file():
-            self.load_error = f"Model artifact not found: {self.model_path}"
-            logger.info("%s", self.load_error)
-            return
-
-        try:
-            # Only load joblib artifacts from trusted sources.
-            artifact = joblib.load(self.model_path)
-
-            if not isinstance(artifact, dict):
-                raise ValueError(
-                    "Model artifact must be a dictionary containing 'pipeline'."
-                )
-
-            pipeline = artifact.get("pipeline")
-
-            if pipeline is None:
-                raise ValueError(
-                    "Model artifact does not contain a 'pipeline' entry."
-                )
-
-            if not callable(getattr(pipeline, "predict", None)):
-                raise ValueError(
-                    "Classifier pipeline does not expose a callable predict method."
-                )
-
-            classes = getattr(pipeline, "classes_", None)
-
-            if classes is None or len(classes) == 0:
-                raise ValueError(
-                    "Classifier pipeline has no fitted classes."
-                )
-
-            self.pipeline = pipeline
-            self.load_error = None
-
-        except Exception as exc:
-            # An invalid model must not be mistaken for a working classifier.
-            self.pipeline = None
-            self.load_error = f"{type(exc).__name__}: {exc}"
-
-            logger.exception(
-                "Could not load text classifier from %s",
-                self.model_path,
-            )
-
-    def reload(self) -> None:
-        """Retry loading the configured model artifact."""
-        self.pipeline = None
-        self.load_error = None
-        self._load_model()
-
-    def predict(self, text: str) -> dict[str, Any]:
-        """Classify non-empty text, or report that classification is unavailable."""
-        if not isinstance(text, str) or not text.strip():
-            raise ValueError("text must be a non-empty string")
-
-        if self.pipeline is None:
-            return {
-                "available": False,
-                "label": "unknown",
-                "confidence": 0.0,
-                "reason": (
-                    "No valid promoted classifier is available. "
-                    "Train and promote a classifier using the project CLI."
-                ),
-                "load_error": self.load_error,
-            }
-
-        predict_proba = getattr(self.pipeline, "predict_proba", None)
-
-        if not callable(predict_proba):
-            return {
-                "available": False,
-                "label": "unknown",
-                "confidence": 0.0,
-                "reason": (
-                    "The loaded classifier does not support predict_proba; "
-                    "calibrated class confidence is unavailable."
-                ),
-                "load_error": None,
-            }
-
-        try:
-            probabilities = predict_proba([text])
-            classes = list(self.pipeline.classes_)
-
-            # Convert supported numeric output into a predictable structure.
-            if getattr(probabilities, "ndim", None) != 2:
-                raise ValueError(
-                    "Classifier probabilities must be a two-dimensional array."
-                )
-
-            if probabilities.shape[0] != 1:
-                raise ValueError(
-                    "Classifier must return exactly one probability row per input."
-                )
-
-            if probabilities.shape[1] != len(classes):
-                raise ValueError(
-                    "Probability count does not match the classifier's classes."
-                )
-
-            row = [float(value) for value in probabilities[0]]
-
-            if not row or not all(math.isfinite(value) for value in row):
-                raise ValueError(
-                    "Classifier returned missing or non-finite probabilities."
-                )
-
-            if any(value < 0.0 or value > 1.0 for value in row):
-                raise ValueError(
-                    "Classifier probabilities must be between 0 and 1."
-                )
-
-            if not math.isclose(sum(row), 1.0, rel_tol=1e-5, abs_tol=1e-6):
-                raise ValueError(
-                    "Classifier probabilities do not sum to approximately 1."
-                )
-
-            best_index = max(range(len(row)), key=row.__getitem__)
-            label = str(classes[best_index])
-            confidence = row[best_index]
-
-            return {
-                "available": True,
-                "label": label,
-                "confidence": confidence,
-                "probabilities": {
-                    str(class_label): probability
-                    for class_label, probability in zip(classes, row)
-                },
-            }
-
-        except Exception as exc:
-            # Classification failure is surfaced explicitly. It is not
-            # represented as a genuine prediction of "unknown".
-            logger.exception("Text classifier prediction failed")
-
-            return {
-                "available": False,
-                "label": "unknown",
-                "confidence": 0.0,
-                "reason": (
-                    "The classifier could not produce a valid prediction."
-                ),
-                "prediction_error": f"{type(exc).__name__}: {exc}",
-            }
-
-
-def _extract_metric_value(metrics: dict[str, Any], key: str) -> float | None:
-    """Extract a valid finite numeric metric; unavailable values stay unavailable.
-
-    Accepts either a scalar:
-        {"cpu_percent": 93.0}
-
-    or a structured metric:
-        {"cpu_percent": {"value": 93.0, "status": "ok"}}
-
-    Structured metrics explicitly marked unavailable or failed are ignored.
-    Booleans, strings, NaN, and infinities are not valid numeric measurements.
-    """
-    if key not in metrics:
+    if not isinstance(record, dict):
         return None
 
-    raw_value = metrics[key]
-
-    if raw_value is None:
+    if record.get("status") != "ok":
         return None
 
-    if isinstance(raw_value, dict):
-        status = raw_value.get("status")
+    value = record.get("value")
 
-        if status is not None and status != "ok":
-            return None
-
-        raw_value = raw_value.get("value")
-
-    if raw_value is None or isinstance(raw_value, bool):
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+    ):
         return None
 
-    if not isinstance(raw_value, (int, float)):
+    return float(value)
+
+
+def load_history(host, agent_id, limit=300):
+    with sqlite3.connect(DB_PATH) as db:
+        db.row_factory = sqlite3.Row
+
+        rows = db.execute("""
+            SELECT id, timestamp, metrics_json
+            FROM telemetry
+            WHERE host = ? AND agent_id = ?
+            ORDER BY timestamp DESC, id DESC
+            LIMIT ?
+        """, (host, agent_id, limit)).fetchall()
+
+    return [
+        {
+            "telemetry_id": row["id"],
+            "timestamp": row["timestamp"],
+            "metrics": json.loads(row["metrics_json"])
+        }
+        for row in reversed(rows)
+    ]
+
+
+def robust_z_score(value, baseline):
+    if len(baseline) < 5:
         return None
 
-    value = float(raw_value)
+    median = statistics.median(baseline)
 
-    if not math.isfinite(value):
-        return None
+    mad = statistics.median(
+        abs(x - median) for x in baseline
+    )
 
-    return value
+    if mad == 0:
+        # A constant baseline cannot be divided by zero.
+        scale = statistics.pstdev(baseline)
+
+        if scale == 0:
+            return 0.0 if value == median else float("inf")
+
+        return abs(value - median) / scale
+
+    return abs(value - median) / (1.4826 * mad)
 
 
-def detect_anomalies(metrics: dict[str, Any]) -> list[dict[str, Any]]:
-    """Detect deterministic threshold anomalies from available telemetry.
+def detect_temporal(history, min_baseline=10, threshold=4.0):
+    findings = []
 
-    This function reports threshold crossings only. It does not establish
-    malicious intent, diagnose root cause, or authorize an action.
+    if len(history) < min_baseline + 1:
+        return findings
 
-    Unavailable and malformed measurements do not generate anomaly findings.
-    Network connection counts are intentionally not required: local connection
-    enumeration may be unavailable, and future network measurements may come
-    from separately supplied datasets or other telemetry sources.
-    """
-    if not isinstance(metrics, dict):
-        raise TypeError("metrics must be a dictionary")
+    current = history[-1]
 
-    findings: list[dict[str, Any]] = []
+    for feature in FEATURES:
+        current_value = metric_value(
+            current["metrics"], feature
+        )
 
-    for key, threshold, category, description in ANOMALY_RULES:
-        value = _extract_metric_value(metrics, key)
-
-        if value is None or value < threshold:
+        if current_value is None:
             continue
 
-        severity = (
-            "high"
-            if value >= threshold * HIGH_SEVERITY_MULTIPLIER
-            else "medium"
-        )
+        baseline = []
 
-        findings.append(
-            {
-                "category": category,
-                "severity": severity,
-                "description": description,
-                "evidence": {
-                    "metric": key,
-                    "observed": value,
-                    "threshold": threshold,
-                    "comparison": ">=",
-                    "rule": "deterministic_threshold_v1",
-                },
+        for sample in history[:-1]:
+            value = metric_value(
+                sample["metrics"], feature
+            )
+
+            if value is not None:
+                baseline.append(value)
+
+        if len(baseline) < min_baseline:
+            continue
+
+        score = robust_z_score(current_value, baseline)
+
+        if score is None or score < threshold:
+            continue
+
+        findings.append({
+            "category": "temporal_anomaly",
+            "severity": "high" if score >= 6 else "medium",
+            "feature": feature,
+            "observed_value": current_value,
+            "baseline_median": statistics.median(baseline),
+            "robust_deviation": (
+                score if math.isfinite(score) else 1_000_000
+            ),
+            "threshold": threshold,
+            "telemetry_id": current["telemetry_id"],
+            "timestamp": current["timestamp"],
+            "evidence": {
+                "baseline_samples": len(baseline),
+                "method": "median_absolute_deviation"
             }
-        )
+        })
 
     return findings
+
+
+def detect_multivariate(
+    history,
+    min_samples=20,
+    threshold=4.0
+):
+    findings = []
+
+    if len(history) < min_samples + 1:
+        return findings
+
+    current = history[-1]
+
+    baseline_vectors = []
+
+    for sample in history[:-1]:
+        vector = [
+            metric_value(sample["metrics"], feature)
+            for feature in FEATURES
+        ]
+
+        if all(value is not None for value in vector):
+            baseline_vectors.append(vector)
+
+    current_vector = [
+        metric_value(current["metrics"], feature)
+        for feature in FEATURES
+    ]
+
+    if (
+        len(baseline_vectors) < min_samples
+        or any(value is None for value in current_vector)
+    ):
+        return findings
+
+    deviations = []
+
+    for i, feature in enumerate(FEATURES):
+        column = [row[i] for row in baseline_vectors]
+
+        median = statistics.median(column)
+
+        mad = statistics.median(
+            abs(x - median) for x in column
+        )
+
+        scale = max(1.4826 * mad, 1e-6)
+
+        deviations.append(
+            abs(current_vector[i] - median) / scale
+        )
+
+    score = math.sqrt(
+        sum(x * x for x in deviations)
+    )
+
+    if score >= threshold:
+        findings.append({
+            "category": "multivariate_anomaly",
+            "severity": "high" if score >= 8 else "medium",
+            "score": score,
+            "threshold": threshold,
+            "features": list(FEATURES),
+            "feature_deviations": dict(
+                zip(FEATURES, deviations)
+            ),
+            "telemetry_id": current["telemetry_id"],
+            "timestamp": current["timestamp"],
+            "evidence": {
+                "baseline_samples": len(baseline_vectors),
+                "method": "joint_robust_deviation"
+            }
+        })
+
+    return findings
+
+
+def detect_sudden_change(history, threshold=3.0):
+    findings = []
+
+    if len(history) < 6:
+        return findings
+
+    previous = history[-2]
+    current = history[-1]
+
+    for feature in FEATURES:
+        old = metric_value(previous["metrics"], feature)
+        new = metric_value(current["metrics"], feature)
+
+        if old is None or new is None:
+            continue
+
+        delta = new - old
+
+        if old != 0:
+            relative_change = abs(delta) / abs(old)
+        else:
+            relative_change = abs(delta)
+
+        if relative_change >= threshold:
+            findings.append({
+                "category": "sudden_change",
+                "severity": "medium",
+                "feature": feature,
+                "previous_value": old,
+                "current_value": new,
+                "change": delta,
+                "telemetry_id": current["telemetry_id"],
+                "timestamp": current["timestamp"],
+            })
+
+    return findings
+
+
+def persist_findings(findings, agent_id, host):
+    created = []
+
+    with sqlite3.connect(DB_PATH) as db:
+        for finding in findings:
+            evidence_id = (
+                f"{finding['telemetry_id']}:"
+                f"{finding['category']}:"
+                f"{finding.get('feature', 'joint')}"
+            )
+
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS intelligence_findings (
+                    evidence_id TEXT PRIMARY KEY,
+                    telemetry_id INTEGER NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    host TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    severity TEXT NOT NULL,
+                    detail_json TEXT NOT NULL
+                )
+            """)
+
+            cursor = db.execute("""
+                INSERT OR IGNORE INTO intelligence_findings (
+                    evidence_id,
+                    telemetry_id,
+                    timestamp,
+                    agent_id,
+                    host,
+                    category,
+                    severity,
+                    detail_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                evidence_id,
+                finding["telemetry_id"],
+                finding["timestamp"],
+                agent_id,
+                host,
+                finding["category"],
+                finding["severity"],
+                json.dumps(finding, allow_nan=False)
+            ))
+
+            if cursor.rowcount:
+                created.append(evidence_id)
+
+    return created
+
+
+def analyze_host(host, agent_id):
+    history = load_history(host, agent_id)
+
+    findings = (
+        detect_temporal(history)
+        + detect_multivariate(history)
+        + detect_sudden_change(history)
+    )
+
+    persisted = persist_findings(
+        findings, agent_id, host
+    )
+
+    return {
+        "host": host,
+        "agent_id": agent_id,
+        "samples_analyzed": len(history),
+        "findings": findings,
+        "persisted_finding_ids": persisted
+    }
