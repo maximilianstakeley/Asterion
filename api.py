@@ -4,9 +4,9 @@
 Telemetry ingestion and retrieval are authenticated.
 Action execution remains disabled.
 """
-
+import sqlite3
 import json
-import secrets
+import secrets, time, hmac, hashlib
 from datetime import datetime, timezone
 from typing import Any
 from pydantic import ValidationError
@@ -33,15 +33,34 @@ from .database import (
     add_network_security_record,
     get_network_security_records,
     init_db,
-    now,
-)
-from .schemas import AnalyzeRequest, FeedbackRequest
+    now,)
+from fastapi import Request
 
+from .intelligence.security import (
+    initialize_security,
+    provision_agent,
+    revoke_agent,
+    authenticate_agent_signed,)
+from .intelligence.ingestion import (
+    initialize_ingestion,
+    ingest_observation,)
+from .intelligence.detection import analyze_host
+
+from .intelligence.correlation import (
+    initialize_correlation,
+    correlate_finding,)
+
+from .intelligence.root_cause import rank_root_causes
+from .schemas import AnalyzeRequest, FeedbackRequest
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialize persistent storage when the API starts."""
     init_db()
+
+    initialize_security()
+    initialize_ingestion()
+    initialize_correlation()
+
     yield
 
 
@@ -77,6 +96,171 @@ def auth(authorization: str | None = Header(default=None)) -> bool:
 
     return True
 
+@app.post(
+    "/v1/admin/agents",
+    dependencies=[Depends(auth)]
+)
+def create_agent(payload: dict = Body(...)):
+    try:
+        credential = provision_agent(
+            payload["agent_id"],
+            payload["allowed_hosts"]
+        )
+
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=str(exc)
+        ) from exc
+
+    return {
+        "agent_id": credential.agent_id,
+        "token": credential.token,
+        "signing_secret": credential.signing_secret,
+        "warning": (
+            "Store these credentials securely. "
+            "They are returned only during provisioning."
+        )
+    }
+
+
+def submit_signed_observation(
+    session,
+    central_url,
+    observation,
+    agent_id,
+    token,
+    signing_secret
+):
+    import json
+
+    path = "/v2/agents/telemetry"
+    url = central_url.rstrip("/") + path
+
+    # The exact bytes signed must be the bytes transmitted.
+    body = json.dumps(
+        observation,
+        separators=(",", ":"),
+        allow_nan=False
+    ).encode("utf-8")
+
+    timestamp = str(int(time.time()))
+    nonce = secrets.token_urlsafe(24)
+
+    body_hash = hashlib.sha256(body).hexdigest()
+
+    canonical = "\n".join([
+        "POST",
+        path,
+        timestamp,
+        nonce,
+        body_hash
+    ])
+
+    signature = hmac.new(
+        signing_secret.encode(),
+        canonical.encode(),
+        hashlib.sha256
+    ).hexdigest()
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-Asterion-Agent": agent_id,
+        "X-Asterion-Agent-Token": token,
+        "X-Asterion-Signing-Secret": signing_secret,
+        "X-Asterion-Timestamp": timestamp,
+        "X-Asterion-Nonce": nonce,
+        "X-Asterion-Signature": signature,
+    }
+
+    response = session.post(
+        url,
+        data=body,
+        headers=headers,
+        timeout=15
+    )
+
+    response.raise_for_status()
+
+    return response.json()
+
+
+@app.delete(
+    "/v1/admin/agents/{agent_id}",
+    dependencies=[Depends(auth)]
+)
+def delete_agent(agent_id: str):
+    try:
+        revoke_agent(agent_id)
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=str(exc)
+        ) from exc
+
+    return {
+        "agent_id": agent_id,
+        "revoked": True
+    }
+@app.post("/v2/agents/telemetry")
+async def authenticated_agent_telemetry(
+    request: Request,
+    x_asterion_agent: str = Header(...),
+    x_asterion_agent_token: str = Header(...),
+    x_asterion_signing_secret: str = Header(...),
+    x_asterion_timestamp: str = Header(...),
+    x_asterion_nonce: str = Header(...),
+    x_asterion_signature: str = Header(...),
+):
+    body = await request.body()
+
+    try:
+        payload = json.loads(body)
+
+        authenticate_agent_signed(
+            agent_id=x_asterion_agent,
+            token=x_asterion_agent_token,
+            signing_secret=x_asterion_signing_secret,
+            timestamp=x_asterion_timestamp,
+            nonce=x_asterion_nonce,
+            signature=x_asterion_signature,
+            method=request.method,
+            path=request.url.path,
+            body=body,
+            host=payload.get("host", ""),
+        )
+
+        if payload.get("agent_id") != x_asterion_agent:
+            raise PermissionError(
+                "Payload agent identity does not match credentials"
+            )
+
+        telemetry_id = ingest_observation(payload)
+
+    except PermissionError as exc:
+        raise HTTPException(
+            status_code=401,
+            detail=str(exc)
+        ) from exc
+
+    except (ValueError, TypeError, KeyError) as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=str(exc)
+        ) from exc
+
+    except sqlite3.Error as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Telemetry persistence unavailable"
+        ) from exc
+
+    return {
+        "accepted": True,
+        "telemetry_id": telemetry_id,
+        "analysis_status": "queued"
+    }
 
 @app.post("/v1/detection/time-window", dependencies=[Depends(auth)])
 def run_time_window_detection(payload: dict = Body(...)):
