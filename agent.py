@@ -38,7 +38,7 @@ def _validate_percentage(metrics, key):
 
     return value
 def _build_structured_observation(observation, agent_id, fallback_host):
-    """Convert collector output into the /v1/telemetry API contract."""
+    """Convert collector output into the authenticated telemetry API contract."""
     import math
 
     raw_metrics = observation.get("metrics", {})
@@ -46,44 +46,32 @@ def _build_structured_observation(observation, agent_id, fallback_host):
 
     if not isinstance(raw_metrics, dict):
         raise ValueError("Collector metrics must be a dictionary")
-
     if not isinstance(raw_status, dict):
         raise ValueError("Collector metric_status must be a dictionary")
-
-    # Validate the exact five model measurements using the same
-    # contract used by the API policy and RL training environment.
-    model_metrics = {
-        name: metrics[name]["value"]
-        for name in (
-            "cpu_percent",
-            "memory_percent",
-            "disk_percent",
-            "network_connections",
-            "load_1m",)}
-
-    model_features = encode_features(model_metrics)
-    "model_features": model_features.as_dict(),
-
-
 
     metrics = {}
     metric_status = {}
     timestamp = observation.get("timestamp")
 
-    def add_metric(name, value, unit, source_status, error=None):
-        if source_status not in {"ok", "unavailable"}:
-            source_status = "unavailable"
+    def source_state(name):
+        record = raw_status.get(name, {})
+        if not isinstance(record, dict):
+            return "unavailable", "Invalid collector status record"
+        status = record.get("status", "unavailable")
+        error = record.get("error")
+        if status not in {"ok", "unavailable"}:
+            return "unavailable", error or f"Invalid source status: {status!r}"
+        return status, error
 
+    def add_metric(name, value, unit, source_status, error=None):
         valid_number = (
             isinstance(value, (int, float))
             and not isinstance(value, bool)
             and math.isfinite(value)
         )
-
         if source_status == "ok" and not valid_number:
             source_status = "unavailable"
             error = error or "Value is missing or is not a finite number"
-
         if source_status == "unavailable":
             value = None
             error = error or "Measurement unavailable"
@@ -96,41 +84,20 @@ def _build_structured_observation(observation, agent_id, fallback_host):
         }
         metric_status[name] = source_status
 
-    def source_state(name):
-        record = raw_status.get(name, {})
-        if not isinstance(record, dict):
-            return "unavailable", "Invalid collector status record"
-
-        return (
-            record.get("status", "unavailable"),
-            record.get("error"),
-        )
-
-    # Scalar host measurements.
     scalar_specs = (
         ("cpu_percent", "cpu_percent", "%", "cpu_percent"),
         ("memory_percent", "memory_percent", "%", "memory_percent"),
         ("disk_percent", "disk_percent", "%", "disk"),
-        ("network_connections", "network_connections",
-         "connections", "connection_metadata"),
+        ("network_connections", "network_connections", "connections", "connection_metadata"),
         ("load_1m", "load_1m", "load average", "load_average"),
     )
-
     for output_name, input_name, unit, source_name in scalar_specs:
         status, error = source_state(source_name)
-        add_metric(
-            output_name,
-            raw_metrics.get(input_name),
-            unit,
-            status,
-            error,
-        )
+        add_metric(output_name, raw_metrics.get(input_name), unit, status, error)
 
-    # Preserve network counters as individual numeric metrics.
     traffic = raw_metrics.get("network_traffic")
     if not isinstance(traffic, dict):
         traffic = {}
-
     traffic_status, traffic_error = source_state("network_traffic")
 
     for name, unit in (
@@ -147,7 +114,6 @@ def _build_structured_observation(observation, agent_id, fallback_host):
             traffic_error,
         )
 
-    # A rate is unavailable until the collector has two valid samples.
     for name, unit in (
         ("bytes_sent_per_second", "bytes/second"),
         ("bytes_recv_per_second", "bytes/second"),
@@ -159,7 +125,6 @@ def _build_structured_observation(observation, agent_id, fallback_host):
             traffic.get("rate_error")
             or "Rate unavailable until a valid sampling interval exists"
         )
-
         add_metric(
             f"network_{name}",
             value,
@@ -168,26 +133,28 @@ def _build_structured_observation(observation, agent_id, fallback_host):
             None if value is not None else rate_error,
         )
 
-    # Derive collection status from the exact metrics being submitted.
-    # This includes network rates that may be unavailable during
-    # the first collection cycle.
-
-    metric_outcomes = [
-        record["status"]
-        for record in metrics.values()
-    ]
-
-    if not metric_outcomes:
+    outcomes = list(metric_status.values())
+    if not outcomes:
         raise ValueError("Observation contains no validated metrics")
-
-    if all(status == "ok" for status in metric_outcomes):
+    if all(status == "ok" for status in outcomes):
         collection_status = "ok"
-
-    elif all(status == "unavailable" for status in metric_outcomes):
+    elif all(status == "unavailable" for status in outcomes):
         collection_status = "failed"
-
     else:
         collection_status = "partial"
+
+    # The live agent and every model consumer use the same versioned encoder.
+    # Encoding the structured records preserves units and availability masks.
+    model_metric_names = (
+        "cpu_percent",
+        "memory_percent",
+        "disk_percent",
+        "network_connections",
+        "load_1m",
+    )
+    model_features = encode_features(
+        {name: metrics[name] for name in model_metric_names}
+    )
 
     return {
         "timestamp": timestamp,
@@ -196,17 +163,15 @@ def _build_structured_observation(observation, agent_id, fallback_host):
         "collection_status": collection_status,
         "metrics": metrics,
         "metric_status": metric_status,
+        "model_features": model_features.as_dict(),
         "metric_details": {
             "disk": raw_metrics.get("disk"),
             "load_average": raw_metrics.get("load_average"),
             "network_traffic": traffic,
-            "connection_metadata": raw_metrics.get(
-                "connection_metadata"
-            ),
+            "connection_metadata": raw_metrics.get("connection_metadata"),
             "collector_metric_status": raw_status,
         },
     }
-
 
 def _build_payload(observation, agent_id, fallback_host, text):
     """Build an API payload while preserving available observation metadata."""
