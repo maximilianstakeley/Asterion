@@ -1,368 +1,217 @@
 
-import argparse
+"""Deterministic baseline policy for Asterion.
+
+Responsibilities:
+- Convert evidence into a deduplicated set of candidate actions.
+- Select a candidate deterministically using explicit priorities and risk.
+- Return the same PolicyOutput contract used by optional reinforcement-learning
+  policies.
+
+This module proposes actions only. It does not execute system changes or
+authorize execution; those responsibilities belong to the safety and executor
+layers.
+"""
+
+from __future__ import annotations
+
+import logging
 import math
-from .feature_contract import encode_features
-import os, submit_signed_observation
-import socket
-import time
-from datetime import datetime, timezone
-import requests
-from .telemetry_collector import TelemetryCollector
-from dotenv import load_dotenv
-load_dotenv()
+from collections.abc import Mapping
+from typing import Any
+
+from .contracts import CandidateAction, PolicyOutput
+
+logger = logging.getLogger(__name__)
 
 
-def collect_metrics(collector):
-    """Return one observation from the shared telemetry collector."""
-    return collector.collect()
+# Candidate-generation rules.
+# Risk values are heuristic scores, not calibrated probabilities or measured
+# probabilities of harm.
+ACTION_BY_CATEGORY: dict[str, tuple[str, float]] = {
+    "high_cpu": ("reduce_noncritical_workload", 0.18),
+    "high_memory": ("collect_diagnostics", 0.05),
+    "high_disk": ("collect_diagnostics", 0.05),
+    "connection_volume": ("review_suspicious_activity", 0.12),
+    "malware_text": ("review_suspicious_activity", 0.12),
+}
+
+DEFAULT_ACTION = "notify_operator"
+DEFAULT_RISK = 0.02
+
+# Lower values have higher priority. The priority determines the primary
+# selection order; risk breaks ties between candidates at the same priority.
+ACTION_PRIORITY: dict[str, int] = {
+    "review_suspicious_activity": 0,
+    "collect_diagnostics": 1,
+    "reduce_noncritical_workload": 2,
+    "notify_operator": 3,
+}
+
+BASELINE_CONFIDENCE = 0.60
 
 
-def _is_finite_number(value):
-    """Return True only for finite numeric values, excluding booleans."""
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(value)
-    )
+def _read_field(item: Any, field: str, default: Any = None) -> Any:
+    """Read a field from a mapping or an object with model attributes."""
+    if isinstance(item, Mapping):
+        return item.get(field, default)
+
+    return getattr(item, field, default)
 
 
-def _validate_percentage(metrics, key):
-    """Preserve unavailable values; reject invalid percentages."""
-    value = metrics.get(key)
+def _safe_text(value: Any, default: str) -> str:
+    """Return non-empty text without trusting arbitrary input types."""
+    if isinstance(value, str) and value.strip():
+        return value.strip()
 
-    if value is None:
-        return None
-
-    if not _is_finite_number(value) or not 0 <= value <= 100:
-        return None
-
-    return value
-def _build_structured_observation(observation, agent_id, fallback_host):
-    """Convert collector output into the /v1/telemetry API contract."""
-    import math
-
-    raw_metrics = observation.get("metrics", {})
-    raw_status = observation.get("metric_status", {})
-
-    if not isinstance(raw_metrics, dict):
-        raise ValueError("Collector metrics must be a dictionary")
-
-    if not isinstance(raw_status, dict):
-        raise ValueError("Collector metric_status must be a dictionary")
-
-    # Validate the exact five model measurements using the same
-    # contract used by the API policy and RL training environment.
-    model_metrics = {
-        name: metrics[name]["value"]
-        for name in (
-            "cpu_percent",
-            "memory_percent",
-            "disk_percent",
-            "network_connections",
-            "load_1m",)}
-
-    model_features = encode_features(model_metrics)
-    "model_features": model_features.as_dict(),
+    return default
 
 
-
-    metrics = {}
-    metric_status = {}
-    timestamp = observation.get("timestamp")
-
-    def add_metric(name, value, unit, source_status, error=None):
-        if source_status not in {"ok", "unavailable"}:
-            source_status = "unavailable"
-
-        valid_number = (
-            isinstance(value, (int, float))
-            and not isinstance(value, bool)
-            and math.isfinite(value)
-        )
-
-        if source_status == "ok" and not valid_number:
-            source_status = "unavailable"
-            error = error or "Value is missing or is not a finite number"
-
-        if source_status == "unavailable":
-            value = None
-            error = error or "Measurement unavailable"
-
-        metrics[name] = {
-            "value": value,
-            "unit": unit,
-            "status": source_status,
-            "error": error,
-        }
-        metric_status[name] = source_status
-
-    def source_state(name):
-        record = raw_status.get(name, {})
-        if not isinstance(record, dict):
-            return "unavailable", "Invalid collector status record"
-
-        return (
-            record.get("status", "unavailable"),
-            record.get("error"),
-        )
-
-    # Scalar host measurements.
-    scalar_specs = (
-        ("cpu_percent", "cpu_percent", "%", "cpu_percent"),
-        ("memory_percent", "memory_percent", "%", "memory_percent"),
-        ("disk_percent", "disk_percent", "%", "disk"),
-        ("network_connections", "network_connections",
-         "connections", "connection_metadata"),
-        ("load_1m", "load_1m", "load average", "load_average"),
-    )
-
-    for output_name, input_name, unit, source_name in scalar_specs:
-        status, error = source_state(source_name)
-        add_metric(
-            output_name,
-            raw_metrics.get(input_name),
-            unit,
-            status,
-            error,
-        )
-
-    # Preserve network counters as individual numeric metrics.
-    traffic = raw_metrics.get("network_traffic")
-    if not isinstance(traffic, dict):
-        traffic = {}
-
-    traffic_status, traffic_error = source_state("network_traffic")
-
-    for name, unit in (
-        ("bytes_sent", "bytes"),
-        ("bytes_recv", "bytes"),
-        ("packets_sent", "packets"),
-        ("packets_recv", "packets"),
-    ):
-        add_metric(
-            f"network_{name}",
-            traffic.get(name),
-            unit,
-            traffic_status,
-            traffic_error,
-        )
-
-    # A rate is unavailable until the collector has two valid samples.
-    for name, unit in (
-        ("bytes_sent_per_second", "bytes/second"),
-        ("bytes_recv_per_second", "bytes/second"),
-        ("packets_sent_per_second", "packets/second"),
-        ("packets_recv_per_second", "packets/second"),
-    ):
-        value = traffic.get(name)
-        rate_error = (
-            traffic.get("rate_error")
-            or "Rate unavailable until a valid sampling interval exists"
-        )
-
-        add_metric(
-            f"network_{name}",
-            value,
-            unit,
-            "ok" if value is not None else "unavailable",
-            None if value is not None else rate_error,
-        )
-
-    # Derive collection status from the exact metrics being submitted.
-    # This includes network rates that may be unavailable during
-    # the first collection cycle.
-
-    metric_outcomes = [
-        record["status"]
-        for record in metrics.values()
-    ]
-
-    if not metric_outcomes:
-        raise ValueError("Observation contains no validated metrics")
-
-    if all(status == "ok" for status in metric_outcomes):
-        collection_status = "ok"
-
-    elif all(status == "unavailable" for status in metric_outcomes):
-        collection_status = "failed"
-
-    else:
-        collection_status = "partial"
-
-    return {
-        "timestamp": timestamp,
-        "agent_id": observation.get("agent_id") or agent_id,
-        "host": observation.get("host") or fallback_host,
-        "collection_status": collection_status,
-        "metrics": metrics,
-        "metric_status": metric_status,
-        "metric_details": {
-            "disk": raw_metrics.get("disk"),
-            "load_average": raw_metrics.get("load_average"),
-            "network_traffic": traffic,
-            "connection_metadata": raw_metrics.get(
-                "connection_metadata"
-            ),
-            "collector_metric_status": raw_status,
-        },
-    }
-
-
-def _build_payload(observation, agent_id, fallback_host, text):
-    """Build an API payload while preserving available observation metadata."""
-    if not isinstance(observation, dict):
-        raise ValueError("Collector must return a dictionary")
-
-    observed_metrics = observation.get("metrics")
-    if not isinstance(observed_metrics, dict):
-        raise ValueError("Collector observation must contain a metrics dictionary")
-
-    host = observation.get("host") or fallback_host
-
-    # Keep missing metrics as None rather than inventing zero values.
-    metrics = {
-        "cpu_percent": _validate_percentage(
-            observed_metrics, "cpu_percent"
-        ),
-        "memory_percent": _validate_percentage(
-            observed_metrics, "memory_percent"
-        ),
-        "disk_percent": _validate_percentage(
-            observed_metrics, "disk_percent"
-        ),
-        "network_connections": observed_metrics.get("network_connections"),
-        "load_1m": observed_metrics.get("load_1m"),
-    }
-
-    # Retain the original observation timestamp when the collector provides it.
-    timestamp = (
-        observation.get("timestamp")
-        or datetime.now(timezone.utc).isoformat()
-    )
-
-    body = {
-        "agent_id": observation.get("agent_id") or agent_id,
-        "host": host,
-        "text": text,
-        "metrics": metrics,
-    }
-
-    # Build the structured payload using the telemetry API contract.
-    structured_observation = _build_structured_observation(
-        observation,
-        agent_id,
-        fallback_host,
-    )
-    return body, structured_observation
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Authorized telemetry-only agent"
-    )
-    parser.add_argument("--central-url", required=True)
-    parser.add_argument("--agent-id", required=True)
-    parser.add_argument("--interval", type=float, default=10)
-    parser.add_argument("--cycles", type=int, default=0)
-    parser.add_argument("--text", default="routine system telemetry")
-    args = parser.parse_args()
-
-    if args.interval < 1:
-        parser.error("--interval must be at least 1 second")
-
-    if args.cycles < 0:
-        parser.error("--cycles must be zero or greater")
-
-    session = requests.Session()
-    agent_token = os.getenv("ASTERION_AGENT_TOKEN")
-    agent_secret = os.getenv("ASTERION_AGENT_SIGNING_SECRET")
-
-    if not agent_token or not agent_secret:
-        parser.error(
-            "Set ASTERION_AGENT_TOKEN and "
-            "ASTERION_AGENT_SIGNING_SECRET"
-        )
-
-    collector = TelemetryCollector(agent_id=args.agent_id)
-    central_url = args.central_url.rstrip("/")
-    analyze_url = central_url + "/v1/analyze"
-
-    # Default to the verified central telemetry endpoint.
-    # Allow an explicit environment variable to override it.
-
-    # Submit structured telemetry to the verified API endpoint by default.
-
-    done = 0
-    fallback_host = socket.gethostname()
+def _valid_risk(value: Any, default: float = DEFAULT_RISK) -> float:
+    """Return a finite risk score in the supported interval [0, 1]."""
+    if isinstance(value, bool):
+        return default
 
     try:
-        while args.cycles == 0 or done < args.cycles:
-            cycle_start = time.monotonic()
+        risk = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
 
-            try:
-                observation = collect_metrics(collector)
-                body, structured_observation = _build_payload(
-                    observation,
-                    args.agent_id,
-                    fallback_host,
-                    args.text,
-                )
-            except Exception as exc:
-                print(f"Collection or payload preparation failed: {exc}")
-                done += 1
-                if args.cycles == 0 or done < args.cycles:
-                    time.sleep(args.interval)
-                continue
+    if not math.isfinite(risk) or not 0.0 <= risk <= 1.0:
+        return default
 
-            # Preserve compatibility with the existing analysis endpoint.
-            try:
-                response = session.post(
-                    analyze_url,
-                    json=body,
-                    timeout=8,
-                )
-                response.raise_for_status()
-                print("Analysis submission succeeded:", response.status_code)
-            except requests.RequestException as exc:
-                print(f"Analysis submission failed: {exc}")
-                if exc.response is not None:
-                    print(f"HTTP status: {exc.response.status_code}")
-                    print(f"API response: {exc.response.text}")
-
-            # Send the full observation only to a verified compatible endpoint.
-
-            # Submit structured telemetry using signed agent authentication.
-            try:
-                result = submit_signed_observation(
-                    session=session,
-                    central_url=central_url,
-                    observation=structured_observation,
-                    agent_id=args.agent_id,
-                    token=agent_token,
-                    signing_secret=agent_secret,
-                )
-
-                print(
-                    "Telemetry accepted:",
-                    result["telemetry_id"],
-                )
-
-            except requests.RequestException as exc:
-                print("Telemetry submission failed:", exc)
-
-                if exc.response is not None:
-                    print("HTTP status:", exc.response.status_code)
-                    print("API response:", exc.response.text)
-
-            done += 1
-
-            if args.cycles == 0 or done < args.cycles:
-                elapsed = time.monotonic() - cycle_start
-                time.sleep(max(0, args.interval - elapsed))
-
-    finally:
-        session.close()
+    return risk
 
 
-if __name__ == "__main__":
-    main()
+def _candidate_key(candidate: CandidateAction) -> tuple[int, float]:
+    """Produce a stable selection key for a validated candidate."""
+    action = candidate.action
+    risk = _valid_risk(candidate.risk)
+
+    return ACTION_PRIORITY.get(action, 99), risk
+
+
+def generate_candidates(
+    evidence: list[dict[str, Any]],
+) -> list[CandidateAction]:
+    """Generate deduplicated action candidates from collected evidence.
+
+    Evidence may be supplied as dictionaries or compatible model objects.
+    Only the first occurrence of each action is retained, preserving evidence
+    order. If no usable evidence produces a candidate, the result is an
+    observation-only notification candidate.
+    """
+    if not isinstance(evidence, (list, tuple)):
+        raise TypeError("evidence must be a list or tuple")
+
+    candidates: list[CandidateAction] = []
+    seen_actions: set[str] = set()
+
+    for index, item in enumerate(evidence):
+        if item is None:
+            logger.warning("Ignoring null evidence item at index %d", index)
+            continue
+
+        category = _safe_text(
+            _read_field(item, "category"),
+            "unknown",
+        )
+
+        description = _safe_text(
+            _read_field(item, "description"),
+            _safe_text(
+                _read_field(item, "detail"),
+                "No description provided",
+            ),
+        )
+
+        action, risk = ACTION_BY_CATEGORY.get(
+            category,
+            (DEFAULT_ACTION, DEFAULT_RISK),
+        )
+
+        if action in seen_actions:
+            continue
+
+        candidates.append(
+            CandidateAction(
+                action=action,
+                risk=risk,
+                rationale=(
+                    f"Candidate generated from {category} evidence: "
+                    f"{description}"
+                ),
+            )
+        )
+        seen_actions.add(action)
+
+    if not candidates:
+        candidates.append(
+            CandidateAction(
+                action=DEFAULT_ACTION,
+                risk=DEFAULT_RISK,
+                rationale=(
+                    "No usable evidence produced an actionable candidate; "
+                    "retain observation-only posture."
+                ),
+            )
+        )
+
+    return candidates
+
+
+def select_action(
+    candidates: list[CandidateAction],
+) -> PolicyOutput:
+    """Select one candidate using the deterministic baseline policy.
+
+    Selection is deterministic for a given ordered candidate list. The
+    function does not invoke an executor, bypass the safety gate, or claim
+    that the selected action is safe to execute.
+    """
+    if not isinstance(candidates, (list, tuple)):
+        raise TypeError("candidates must be a list or tuple")
+
+    if not candidates:
+        raise ValueError("Cannot select an action from an empty candidate list")
+
+    for index, candidate in enumerate(candidates):
+        if candidate is None:
+            raise ValueError(
+                f"Candidate at index {index} is null"
+            )
+
+        action = getattr(candidate, "action", None)
+        if not isinstance(action, str) or not action.strip():
+            raise ValueError(
+                f"Candidate at index {index} has an invalid action"
+            )
+
+        risk = getattr(candidate, "risk", None)
+        if isinstance(risk, bool):
+            raise ValueError(
+                f"Candidate at index {index} has an invalid risk score"
+            )
+
+        try:
+            numeric_risk = float(risk)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"Candidate at index {index} has an invalid risk score"
+            ) from exc
+
+        if not math.isfinite(numeric_risk) or not 0.0 <= numeric_risk <= 1.0:
+            raise ValueError(
+                f"Candidate at index {index} risk must be finite and in [0, 1]"
+            )
+
+    chosen = min(candidates, key=_candidate_key)
+
+    return PolicyOutput(
+        selected_action=chosen.action,
+        confidence=BASELINE_CONFIDENCE,
+        rationale=(
+            "Selected by deterministic baseline priority; "
+            f"candidate risk={float(chosen.risk):.2f}. "
+            "This selection is a proposal, not execution authorization."
+        ),
+    )

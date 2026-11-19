@@ -1,439 +1,435 @@
 
-"""Simulation-only transactional adapter with scoped HMAC authorization.
+"""
+Asterion network monitoring and advisory optimization.
 
-This module modifies in-memory simulated state only. It does not access,
-inspect, or modify real hosts. Production/live execution is intentionally
-absent.
+Collects per-interface network counters, calculates rates from successive
+samples, and reports connection states when permitted by the operating system.
+
+This module is observation-only. It does not modify network configuration,
+firewall rules, routes, sockets, or processes.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from hashlib import sha256
-import hmac
-import json
+from datetime import datetime, timezone
 import math
-import secrets
 import threading
 import time
-from collections.abc import Mapping
-from typing import Any, Callable
+from typing import Any
 
-from .contracts import CandidateAction, SafetyVerdict
-
-
-SIMULATED_ACTIONS = frozenset({"reduce_noncritical_workload"})
-
-MIN_SECRET_LENGTH = 32
-MIN_TTL_SECONDS = 1
-MAX_TTL_SECONDS = 300
-MAX_SIMULATED_RISK = 0.20
-
-MIN_WORKLOAD_LEVEL = 0.10
-MAX_WORKLOAD_LEVEL = 1.00
-WORKLOAD_REDUCTION = 0.15
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 
-@dataclass(frozen=True)
-class AuthorizationGrant:
-    """Short-lived authorization capability scoped to one target and action."""
-
-    target: str
-    action: str
-    expires_at: int
-    nonce: str
-    signature: str
+def utc_now() -> str:
+    """Return the current UTC timestamp in ISO 8601 format."""
+    return datetime.now(timezone.utc).isoformat()
 
 
-class AuthorizationAuthority:
-    """Issue and verify short-lived HMAC-signed simulation grants.
+class NetworkMonitor:
+    """Collect per-interface network statistics across sampling intervals."""
 
-    The secret must be generated and managed independently. This in-memory
-    authority is suitable for controlled simulation/testing, not a complete
-    production identity or authorization system.
-    """
+    COUNTER_ATTRIBUTES = {
+        "bytes_sent": "bytes_sent",
+        "bytes_recv": "bytes_recv",
+        "packets_sent": "packets_sent",
+        "packets_recv": "packets_recv",
+        "errors_out": "errout",
+        "errors_in": "errin",
+        "drops_out": "dropout",
+        "drops_in": "dropin",
+    }
 
-    def __init__(self, secret: bytes) -> None:
-        if not isinstance(secret, bytes) or len(secret) < MIN_SECRET_LENGTH:
-            raise ValueError(
-                f"authorization secret must be bytes of at least "
-                f"{MIN_SECRET_LENGTH} bytes"
-            )
+    REQUIRED_COUNTERS = (
+        "bytes_sent",
+        "bytes_recv",
+        "packets_sent",
+        "packets_recv",
+    )
 
-        self._secret = secret
-        self._used_nonces: set[str] = set()
+    def __init__(self, *, include_loopback: bool = False) -> None:
+        self.include_loopback = include_loopback
+
+        # Interface name -> (monotonic timestamp, previous counter values).
+        self._previous: dict[
+            str, tuple[float, dict[str, int | None]]
+        ] = {}
+
         self._lock = threading.Lock()
 
-    @staticmethod
-    def _payload(
-        *,
-        target: str,
-        action: str,
-        expires_at: int,
-        nonce: str,
-    ) -> dict[str, Any]:
-        """Construct the canonical fields covered by the signature."""
-        return {
-            "target": target,
-            "action": action,
-            "expires_at": expires_at,
-            "nonce": nonce,
-        }
+    def collect(self) -> dict[str, Any]:
+        """Collect one observation without substituting missing measurements."""
 
-    def _sign(self, payload: Mapping[str, Any]) -> str:
-        canonical = json.dumps(
-            dict(payload),
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-        ).encode("utf-8")
+        timestamp = utc_now()
 
-        return hmac.new(
-            self._secret,
-            canonical,
-            sha256,
-        ).hexdigest()
-
-    def issue(
-        self,
-        *,
-        target: str,
-        action: str,
-        ttl_seconds: int = 60,
-    ) -> AuthorizationGrant:
-        """Issue a grant limited to an allowlisted simulated action."""
-        if not isinstance(target, str) or not target.strip():
-            raise ValueError("target must be a non-empty string")
-
-        if action not in SIMULATED_ACTIONS:
-            raise ValueError(
-                "authority only issues grants for allowlisted simulated actions"
-            )
-
-        if isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, int):
-            raise ValueError("ttl_seconds must be an integer")
-
-        if not MIN_TTL_SECONDS <= ttl_seconds <= MAX_TTL_SECONDS:
-            raise ValueError(
-                f"ttl_seconds must be {MIN_TTL_SECONDS}..{MAX_TTL_SECONDS}"
-            )
-
-        payload = self._payload(
-            target=target,
-            action=action,
-            expires_at=int(time.time()) + ttl_seconds,
-            nonce=secrets.token_hex(16),
-        )
-
-        return AuthorizationGrant(
-            **payload,
-            signature=self._sign(payload),
-        )
-
-    def verify(
-        self,
-        grant: AuthorizationGrant | None,
-        *,
-        target: str,
-        action: str,
-    ) -> tuple[bool, str]:
-        """Verify signature, expiry, scope, allowlist, and single-use nonce."""
-        if grant is None:
-            return False, "missing_authorization_grant"
-
-        if not isinstance(grant, AuthorizationGrant):
-            return False, "invalid_authorization_grant"
-
-        if (
-            not isinstance(grant.target, str)
-            or not isinstance(grant.action, str)
-            or not isinstance(grant.nonce, str)
-            or not isinstance(grant.signature, str)
-            or isinstance(grant.expires_at, bool)
-            or not isinstance(grant.expires_at, int)
-        ):
-            return False, "invalid_authorization_grant_fields"
-
-        if not grant.target.strip() or not grant.nonce or not grant.signature:
-            return False, "invalid_authorization_grant_fields"
-
-        payload = self._payload(
-            target=grant.target,
-            action=grant.action,
-            expires_at=grant.expires_at,
-            nonce=grant.nonce,
-        )
-
-        expected_signature = self._sign(payload)
-
-        if not hmac.compare_digest(expected_signature, grant.signature):
-            return False, "invalid_grant_signature"
-
-        if grant.expires_at <= int(time.time()):
-            return False, "authorization_grant_expired"
-
-        if grant.target != target or grant.action != action:
-            return False, "grant_scope_mismatch"
-
-        if grant.action not in SIMULATED_ACTIONS:
-            return False, "action_not_allowlisted_for_simulation"
-
-        # The check-and-add is atomic, so concurrent verification attempts
-        # cannot successfully reuse the same grant.
-        with self._lock:
-            if grant.nonce in self._used_nonces:
-                return False, "authorization_grant_replayed"
-
-            self._used_nonces.add(grant.nonce)
-
-        return True, "authorized_for_simulation_only"
-
-
-class SimulatedHostAdapter:
-    """Thread-safe in-memory stand-in for a host.
-
-    All state belongs to this Python object. No operating-system, process,
-    network, or remote-host operations are performed.
-    """
-
-    def __init__(
-        self,
-        target: str,
-        workload_level: float = 0.70,
-    ) -> None:
-        if not isinstance(target, str) or not target.strip():
-            raise ValueError("target must be a non-empty string")
-
-        if isinstance(workload_level, bool):
-            raise ValueError("workload_level must be a finite number in [0, 1]")
+        if psutil is None:
+            return {
+                "timestamp": timestamp,
+                "collection_status": "failed",
+                "interfaces": None,
+                "connection_summary": None,
+                "metric_status": {
+                    "network_interfaces": {
+                        "status": "unavailable",
+                        "reason": "psutil is not installed",
+                    },
+                    "network_connections": {
+                        "status": "unavailable",
+                        "reason": "psutil is not installed",
+                    },
+                },
+            }
 
         try:
-            level = float(workload_level)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(
-                "workload_level must be a finite number in [0, 1]"
-            ) from exc
-
-        if (
-            not math.isfinite(level)
-            or not MIN_WORKLOAD_LEVEL <= level <= MAX_WORKLOAD_LEVEL
-        ):
-            raise ValueError("workload_level must be finite and in [0.1, 1.0]")
-
-        self.target = target
-        self._state = {
-            "workload_level": level,
-            "revision": 0,
-        }
-        self._transaction_lock = threading.RLock()
-
-    def snapshot(self) -> dict[str, Any]:
-        """Return a copy of the current simulated state."""
-        with self._transaction_lock:
-            return dict(self._state)
-
-    def apply(self, action: str) -> dict[str, Any]:
-        """Apply the supported simulated action to in-memory state."""
-        if action not in SIMULATED_ACTIONS:
-            raise ValueError("action_not_supported_by_simulator")
-
-        with self._transaction_lock:
-            current_level = self._state["workload_level"]
-
-            if current_level <= MIN_WORKLOAD_LEVEL:
-                raise ValueError("simulated_workload_already_at_minimum")
-
-            next_level = max(
-                MIN_WORKLOAD_LEVEL,
-                current_level - WORKLOAD_REDUCTION,
+            counters = psutil.net_io_counters(
+                pernic=True,
+                nowrap=False,
             )
 
-            if next_level >= current_level:
-                raise RuntimeError("simulated_state_transition_not_progressing")
+            if counters is None:
+                raise RuntimeError(
+                    "Operating system returned no interface counters"
+                )
 
-            self._state["workload_level"] = next_level
-            self._state["revision"] += 1
+        except Exception as exc:
+            return {
+                "timestamp": timestamp,
+                "collection_status": "failed",
+                "interfaces": None,
+                "connection_summary": None,
+                "metric_status": {
+                    "network_interfaces": {
+                        "status": "unavailable",
+                        "reason": f"{type(exc).__name__}: {exc}",
+                    },
+                    "network_connections": {
+                        "status": "unavailable",
+                        "reason": (
+                            "Interface collection failed; "
+                            "connection inspection was not attempted"
+                        ),
+                    },
+                },
+            }
 
-            return dict(self._state)
+        sample_time = time.monotonic()
 
-    def restore(self, snapshot: Mapping[str, Any]) -> None:
-        """Restore a previously captured, validated in-memory snapshot."""
-        if not isinstance(snapshot, Mapping):
-            raise ValueError("snapshot must be a mapping")
+        with self._lock:
+            previous_samples = dict(self._previous)
 
-        level = snapshot.get("workload_level")
-        revision = snapshot.get("revision")
+        interfaces: dict[str, Any] = {}
+        current_samples: dict[
+            str, tuple[float, dict[str, int | None]]
+        ] = {}
 
-        if (
-            isinstance(level, bool)
-            or not isinstance(level, (int, float))
-            or not math.isfinite(float(level))
-            or not MIN_WORKLOAD_LEVEL <= float(level) <= MAX_WORKLOAD_LEVEL
-        ):
-            raise ValueError("snapshot contains an invalid workload level")
+        for interface_name, counter_object in counters.items():
 
-        if (
-            isinstance(revision, bool)
-            or not isinstance(revision, int)
-            or revision < 0
-        ):
-            raise ValueError("snapshot contains an invalid revision")
+            if (
+                not self.include_loopback
+                and interface_name.lower()
+                in {"lo", "lo0", "loopback"}
+            ):
+                continue
 
-        if set(snapshot.keys()) != {"workload_level", "revision"}:
-            raise ValueError("snapshot contains unexpected fields")
+            values: dict[str, int | None] = {}
 
-        with self._transaction_lock:
-            self._state = {
-                "workload_level": float(level),
-                "revision": revision,
+            for field, attribute in self.COUNTER_ATTRIBUTES.items():
+                value = getattr(counter_object, attribute, None)
+
+                if isinstance(value, int) and value >= 0:
+                    values[field] = value
+                else:
+                    # Some operating systems do not expose every counter.
+                    values[field] = None
+
+            previous = previous_samples.get(interface_name)
+
+            elapsed = (
+                sample_time - previous[0]
+                if previous is not None
+                else None
+            )
+
+            def calculate_rate(field: str) -> float | None:
+                """Calculate a rate only from valid, monotonic counter data."""
+
+                if previous is None or elapsed is None or elapsed <= 0:
+                    return None
+
+                current_value = values.get(field)
+                previous_value = previous[1].get(field)
+
+                if current_value is None or previous_value is None:
+                    return None
+
+                # A decreasing counter may indicate reset or wraparound.
+                # Do not manufacture a rate from that observation.
+                if current_value < previous_value:
+                    return None
+
+                rate = (current_value - previous_value) / elapsed
+
+                if not math.isfinite(rate) or rate < 0:
+                    return None
+
+                return rate
+
+            required_available = all(
+                values[field] is not None
+                for field in self.REQUIRED_COUNTERS
+            )
+
+            rates = {
+                "bytes_sent_per_second": calculate_rate("bytes_sent"),
+                "bytes_recv_per_second": calculate_rate("bytes_recv"),
+                "packets_sent_per_second": calculate_rate("packets_sent"),
+                "packets_recv_per_second": calculate_rate("packets_recv"),
+            }
+
+            valid_interval = elapsed is not None and elapsed > 0
+
+            interfaces[interface_name] = {
+                "status": (
+                    "ok" if required_available else "partial"
+                ),
+                **{
+                    f"{field}_total": value
+                    for field, value in values.items()
+                },
+                **rates,
+                "sample_interval_seconds": (
+                    elapsed if valid_interval else None
+                ),
+                "rate_status": (
+                    "ok"
+                    if valid_interval
+                    and any(value is not None for value in rates.values())
+                    else "unavailable"
+                ),
+                "rate_unavailable_reason": (
+                    None
+                    if valid_interval
+                    and any(value is not None for value in rates.values())
+                    else (
+                        "A second valid sample is required, "
+                        "or counters reset or became unavailable"
+                    )
+                ),
+            }
+
+            current_samples[interface_name] = (
+                sample_time,
+                values,
+            )
+
+        with self._lock:
+            self._previous = current_samples
+
+        connection_summary, connection_status = (
+            self._collect_connections()
+        )
+
+        interface_status = (
+            "ok"
+            if interfaces
+            and all(
+                item["status"] == "ok"
+                for item in interfaces.values()
+            )
+            else "partial"
+        )
+
+        return {
+            "timestamp": timestamp,
+            "collection_status": (
+                "ok"
+                if interface_status == "ok"
+                and connection_status["status"] == "ok"
+                else "partial"
+            ),
+            "interfaces": interfaces,
+            "connection_summary": connection_summary,
+            "metric_status": {
+                "network_interfaces": {
+                    "status": interface_status,
+                    "reason": (
+                        None
+                        if interface_status == "ok"
+                        else (
+                            "Some interface counters are unavailable "
+                            "or no eligible interfaces were found"
+                        )
+                    ),
+                },
+                "network_connections": connection_status,
+            },
+        }
+
+    @staticmethod
+    def _collect_connections(
+    ) -> tuple[dict[str, Any] | None, dict[str, str | None]]:
+        """
+        Count visible Internet socket states.
+
+        Connection addresses and process names are not retained.
+        Permission failures produce unavailable data, never a count of zero.
+        """
+
+        if psutil is None:
+            return None, {
+                "status": "unavailable",
+                "reason": "psutil is not installed",
+            }
+
+        try:
+            connections = psutil.net_connections(kind="inet")
+
+            state_counts: dict[str, int] = {}
+
+            for connection in connections:
+                state = str(
+                    getattr(connection, "status", None) or "UNKNOWN"
+                ).upper()
+
+                state_counts[state] = state_counts.get(state, 0) + 1
+
+            return {
+                "total_visible_connections": len(connections),
+                "states": state_counts,
+                "scope": (
+                    "Connections visible to the current process; "
+                    "results may be permission-limited"
+                ),
+            }, {
+                "status": "ok",
+                "reason": None,
+            }
+
+        except Exception as exc:
+            access_denied = isinstance(exc, PermissionError)
+
+            if psutil is not None:
+                access_denied = access_denied or isinstance(
+                    exc,
+                    getattr(psutil, "AccessDenied", PermissionError),
+                )
+
+            reason = (
+                "Operating system denied connection inspection"
+                if access_denied
+                else "Connection inspection failed"
+            )
+
+            return None, {
+                "status": "unavailable",
+                "reason": f"{type(exc).__name__}: {reason}",
             }
 
 
-class SimulatedTransactionalExecutor:
-    """Execute an authorized action against simulated state with rollback.
+def propose_network_optimizations(
+    observation: dict[str, Any],
+    *,
+    high_receive_bytes_per_second: float = 50_000_000,
+    high_error_delta: int = 10,
+    high_drop_delta: int = 10,
+) -> list[dict[str, Any]]:
+    """
+    Generate evidence-based recommendations without executing them.
 
-    A successful result means only that the in-memory simulation changed.
-    It does not mean a real host action was executed.
+    The thresholds are configurable starting points, not universal
+    definitions of network failure.
     """
 
-    def __init__(
-        self,
-        authority: AuthorizationAuthority,
-        adapter: SimulatedHostAdapter,
-        fault_hook: Callable[[str], None] | None = None,
-    ) -> None:
-        if not isinstance(authority, AuthorizationAuthority):
-            raise TypeError("authority must be an AuthorizationAuthority")
+    proposals: list[dict[str, Any]] = []
 
-        if not isinstance(adapter, SimulatedHostAdapter):
-            raise TypeError("adapter must be a SimulatedHostAdapter")
+    interfaces = observation.get("interfaces")
 
-        if fault_hook is not None and not callable(fault_hook):
-            raise TypeError("fault_hook must be callable or None")
+    if not isinstance(interfaces, dict):
+        return proposals
 
-        self.authority = authority
-        self.adapter = adapter
-        self.fault_hook = fault_hook or (lambda stage: None)
+    for interface_name, data in interfaces.items():
 
-    @staticmethod
-    def _blocked(reason: str) -> dict[str, Any]:
-        return {
-            "status": "blocked",
-            "executed": False,
-            "live_system_changes": False,
-            "reason": reason,
-        }
+        if not isinstance(data, dict):
+            continue
 
-    @staticmethod
-    def _valid_candidate_risk(candidate: Any) -> float | None:
-        risk = getattr(candidate, "risk", None)
+        receive_rate = data.get("bytes_recv_per_second")
 
-        if isinstance(risk, bool):
-            return None
+        if (
+            isinstance(receive_rate, (int, float))
+            and math.isfinite(receive_rate)
+            and receive_rate >= high_receive_bytes_per_second
+        ):
+            proposals.append({
+                "category": "capacity_review",
+                "severity": "info",
+                "interface": interface_name,
+                "evidence": {
+                    "bytes_recv_per_second": receive_rate,
+                    "threshold": high_receive_bytes_per_second,
+                },
+                "recommendation": (
+                    "Verify whether this throughput is expected. "
+                    "Compare application demand and interface capacity "
+                    "before changing configuration."
+                ),
+                "execution": "disabled",
+            })
 
-        try:
-            value = float(risk)
-        except (TypeError, ValueError, OverflowError):
-            return None
-
-        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
-            return None
-
-        return value
-
-    def execute(
-        self,
-        candidate: CandidateAction,
-        verdict: SafetyVerdict,
-        grant: AuthorizationGrant | None,
-    ) -> dict[str, Any]:
-        """Run the simulated transaction, verifying and rolling back as needed."""
-        if candidate is None:
-            return self._blocked("missing_candidate")
-
-        action = getattr(candidate, "action", None)
-        if not isinstance(action, str) or not action.strip():
-            return self._blocked("invalid_candidate_action")
-
-        if action not in SIMULATED_ACTIONS:
-            return self._blocked("action_not_supported_by_simulator")
-
-        if verdict is None or getattr(verdict, "allowed", None) is not True:
-            return self._blocked("safety_gate_blocked")
-
-        risk = self._valid_candidate_risk(candidate)
-        if risk is None:
-            return self._blocked("invalid_candidate_risk")
-
-        if risk > MAX_SIMULATED_RISK:
-            return self._blocked("simulator_risk_limit_exceeded")
-
-        valid, reason = self.authority.verify(
-            grant,
-            target=self.adapter.target,
-            action=action,
+        checks = (
+            (
+                "errors_in_delta",
+                "receive_errors",
+                high_error_delta,
+                (
+                    "Inspect link health, driver logs, and upstream "
+                    "equipment. Confirm repeated error deltas."
+                ),
+            ),
+            (
+                "errors_out_delta",
+                "transmit_errors",
+                high_error_delta,
+                (
+                    "Inspect link health and driver logs. Confirm "
+                    "repeated transmit-error deltas."
+                ),
+            ),
+            (
+                "drops_in_delta",
+                "receive_drops",
+                high_drop_delta,
+                (
+                    "Check receive queue pressure and host load "
+                    "across multiple samples before tuning buffers."
+                ),
+            ),
+            (
+                "drops_out_delta",
+                "transmit_drops",
+                high_drop_delta,
+                (
+                    "Check transmit queue pressure and congestion "
+                    "across multiple samples before changing queue settings."
+                ),
+            ),
         )
 
-        if not valid:
-            return self._blocked(reason)
+        for field, category, threshold, recommendation in checks:
+            value = data.get(field)
 
-        # Hold the lock across snapshot, mutation, verification, and rollback.
-        # This prevents another transaction using this adapter from interleaving
-        # with the current transaction.
-        with self.adapter._transaction_lock:
-            before = self.adapter.snapshot()
+            if isinstance(value, int) and value >= threshold:
+                proposals.append({
+                    "category": category,
+                    "severity": "warning",
+                    "interface": interface_name,
+                    "evidence": {
+                        field: value,
+                        "threshold": threshold,
+                    },
+                    "recommendation": recommendation,
+                    "execution": "disabled",
+                })
 
-            try:
-                self.fault_hook("before_apply")
-
-                after = self.adapter.apply(action)
-
-                self.fault_hook("after_apply")
-
-                # Verify the expected bounded state transition.
-                valid_transition = (
-                    isinstance(after, dict)
-                    and isinstance(after.get("workload_level"), (int, float))
-                    and not isinstance(after.get("workload_level"), bool)
-                    and math.isfinite(float(after["workload_level"]))
-                    and before["workload_level"] > after["workload_level"]
-                    and MIN_WORKLOAD_LEVEL <= after["workload_level"] <= MAX_WORKLOAD_LEVEL
-                    and after.get("revision") == before["revision"] + 1
-                )
-
-                if not valid_transition:
-                    raise RuntimeError("postcondition_verification_failed")
-
-                self.fault_hook("after_verify")
-
-                return {
-                    "status": "simulated_success",
-                    "executed": True,
-                    "live_system_changes": False,
-                    "execution_mode": "in_memory_simulation",
-                    "before": before,
-                    "after": dict(after),
-                    "rollback": "not_needed",
-                    "rollback_verified": None,
-                }
-
-            except Exception as exc:
-                try:
-                    self.adapter.restore(before)
-                    after_rollback = self.adapter.snapshot()
-                    restored = after_rollback == before
-                except Exception:
-                    restored = False
-                    after_rollback = {"state_unavailable": True}
-
-                return {
-                    "status": "rolled_back" if restored else "rollback_failed",
-                    "executed": True,
-                    "live_system_changes": False,
-                    "execution_mode": "in_memory_simulation",
-                    "error": type(exc).__name__,
-                    "before": before,
-                    "after": after_rollback,
-                    "rollback": "verified" if restored else "failed",
-                    "rollback_verified": restored,
-                }
+    return proposals
