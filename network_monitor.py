@@ -1,435 +1,246 @@
 
-"""
-Asterion network monitoring and advisory optimization.
+"""Authoritative telemetry-to-model feature contract for Asterion.
 
-Collects per-interface network counters, calculates rates from successive
-samples, and reports connection states when permitted by the operating system.
+Model vector layout:
+    [cpu, memory, disk, network_connections, load_1m,
+     cpu_available, memory_available, disk_available,
+     network_connections_available, load_1m_available]
 
-This module is observation-only. It does not modify network configuration,
-firewall rules, routes, sockets, or processes.
+The first five values are normalized to [0, 1].
+The final five values are binary availability indicators.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import math
-import threading
-import time
+from dataclasses import dataclass
 from typing import Any
 
-try:
-    import psutil
-except ImportError:
-    psutil = None
+import numpy as np
 
 
-def utc_now() -> str:
-    """Return the current UTC timestamp in ISO 8601 format."""
-    return datetime.now(timezone.utc).isoformat()
+CONTRACT_VERSION = "asterion_telemetry_features_v1"
+FEATURE_DIMENSION = 10
+MEASUREMENT_DIMENSION = 5
+
+# The order here is authoritative. Do not independently reorder features
+# in the agent, API, training environment, or policy adapter.
+FEATURE_NAMES = (
+    "cpu_percent",
+    "memory_percent",
+    "disk_percent",
+    "network_connections",
+    "load_1m",
+)
+
+AVAILABILITY_NAMES = tuple(
+    f"{name}_available" for name in FEATURE_NAMES
+)
+
+# Scales are normalization reference points, not physical maximums.
+NORMALIZATION_SCALES = {
+    "cpu_percent": 100.0,
+    "memory_percent": 100.0,
+    "disk_percent": 100.0,
+    "network_connections": 500.0,
+    "load_1m": 8.0,
+}
+
+UNITS = {
+    "cpu_percent": "%",
+    "memory_percent": "%",
+    "disk_percent": "%",
+    "network_connections": "connections",
+    "load_1m": "load average",
+}
+
+# Validation limits are deliberately distinct from normalization scales.
+# For example, a connection count above 500 is valid; its normalized
+# value is clipped to 1.0 rather than rejected.
+VALID_RANGES = {
+    "cpu_percent": (0.0, 100.0),
+    "memory_percent": (0.0, 100.0),
+    "disk_percent": (0.0, 100.0),
+    "network_connections": (0.0, 10_000_000.0),
+    "load_1m": (0.0, 1_000_000.0),
+}
 
 
-class NetworkMonitor:
-    """Collect per-interface network statistics across sampling intervals."""
+@dataclass(frozen=True)
+class EncodedFeatures:
+    """Encoded model input plus inspectable measurement metadata."""
 
-    COUNTER_ATTRIBUTES = {
-        "bytes_sent": "bytes_sent",
-        "bytes_recv": "bytes_recv",
-        "packets_sent": "packets_sent",
-        "packets_recv": "packets_recv",
-        "errors_out": "errout",
-        "errors_in": "errin",
-        "drops_out": "dropout",
-        "drops_in": "dropin",
-    }
+    vector: np.ndarray
+    values: tuple[float | None, ...]
+    availability: tuple[int, ...]
+    feature_names: tuple[str, ...]
+    availability_names: tuple[str, ...]
+    contract_version: str
 
-    REQUIRED_COUNTERS = (
-        "bytes_sent",
-        "bytes_recv",
-        "packets_sent",
-        "packets_recv",
-    )
-
-    def __init__(self, *, include_loopback: bool = False) -> None:
-        self.include_loopback = include_loopback
-
-        # Interface name -> (monotonic timestamp, previous counter values).
-        self._previous: dict[
-            str, tuple[float, dict[str, int | None]]
-        ] = {}
-
-        self._lock = threading.Lock()
-
-    def collect(self) -> dict[str, Any]:
-        """Collect one observation without substituting missing measurements."""
-
-        timestamp = utc_now()
-
-        if psutil is None:
-            return {
-                "timestamp": timestamp,
-                "collection_status": "failed",
-                "interfaces": None,
-                "connection_summary": None,
-                "metric_status": {
-                    "network_interfaces": {
-                        "status": "unavailable",
-                        "reason": "psutil is not installed",
-                    },
-                    "network_connections": {
-                        "status": "unavailable",
-                        "reason": "psutil is not installed",
-                    },
-                },
-            }
-
-        try:
-            counters = psutil.net_io_counters(
-                pernic=True,
-                nowrap=False,
-            )
-
-            if counters is None:
-                raise RuntimeError(
-                    "Operating system returned no interface counters"
-                )
-
-        except Exception as exc:
-            return {
-                "timestamp": timestamp,
-                "collection_status": "failed",
-                "interfaces": None,
-                "connection_summary": None,
-                "metric_status": {
-                    "network_interfaces": {
-                        "status": "unavailable",
-                        "reason": f"{type(exc).__name__}: {exc}",
-                    },
-                    "network_connections": {
-                        "status": "unavailable",
-                        "reason": (
-                            "Interface collection failed; "
-                            "connection inspection was not attempted"
-                        ),
-                    },
-                },
-            }
-
-        sample_time = time.monotonic()
-
-        with self._lock:
-            previous_samples = dict(self._previous)
-
-        interfaces: dict[str, Any] = {}
-        current_samples: dict[
-            str, tuple[float, dict[str, int | None]]
-        ] = {}
-
-        for interface_name, counter_object in counters.items():
-
-            if (
-                not self.include_loopback
-                and interface_name.lower()
-                in {"lo", "lo0", "loopback"}
-            ):
-                continue
-
-            values: dict[str, int | None] = {}
-
-            for field, attribute in self.COUNTER_ATTRIBUTES.items():
-                value = getattr(counter_object, attribute, None)
-
-                if isinstance(value, int) and value >= 0:
-                    values[field] = value
-                else:
-                    # Some operating systems do not expose every counter.
-                    values[field] = None
-
-            previous = previous_samples.get(interface_name)
-
-            elapsed = (
-                sample_time - previous[0]
-                if previous is not None
-                else None
-            )
-
-            def calculate_rate(field: str) -> float | None:
-                """Calculate a rate only from valid, monotonic counter data."""
-
-                if previous is None or elapsed is None or elapsed <= 0:
-                    return None
-
-                current_value = values.get(field)
-                previous_value = previous[1].get(field)
-
-                if current_value is None or previous_value is None:
-                    return None
-
-                # A decreasing counter may indicate reset or wraparound.
-                # Do not manufacture a rate from that observation.
-                if current_value < previous_value:
-                    return None
-
-                rate = (current_value - previous_value) / elapsed
-
-                if not math.isfinite(rate) or rate < 0:
-                    return None
-
-                return rate
-
-            required_available = all(
-                values[field] is not None
-                for field in self.REQUIRED_COUNTERS
-            )
-
-            rates = {
-                "bytes_sent_per_second": calculate_rate("bytes_sent"),
-                "bytes_recv_per_second": calculate_rate("bytes_recv"),
-                "packets_sent_per_second": calculate_rate("packets_sent"),
-                "packets_recv_per_second": calculate_rate("packets_recv"),
-            }
-
-            valid_interval = elapsed is not None and elapsed > 0
-
-            interfaces[interface_name] = {
-                "status": (
-                    "ok" if required_available else "partial"
-                ),
-                **{
-                    f"{field}_total": value
-                    for field, value in values.items()
-                },
-                **rates,
-                "sample_interval_seconds": (
-                    elapsed if valid_interval else None
-                ),
-                "rate_status": (
-                    "ok"
-                    if valid_interval
-                    and any(value is not None for value in rates.values())
-                    else "unavailable"
-                ),
-                "rate_unavailable_reason": (
-                    None
-                    if valid_interval
-                    and any(value is not None for value in rates.values())
-                    else (
-                        "A second valid sample is required, "
-                        "or counters reset or became unavailable"
-                    )
-                ),
-            }
-
-            current_samples[interface_name] = (
-                sample_time,
-                values,
-            )
-
-        with self._lock:
-            self._previous = current_samples
-
-        connection_summary, connection_status = (
-            self._collect_connections()
-        )
-
-        interface_status = (
-            "ok"
-            if interfaces
-            and all(
-                item["status"] == "ok"
-                for item in interfaces.values()
-            )
-            else "partial"
-        )
-
+    def as_dict(self) -> dict[str, Any]:
         return {
-            "timestamp": timestamp,
-            "collection_status": (
-                "ok"
-                if interface_status == "ok"
-                and connection_status["status"] == "ok"
-                else "partial"
-            ),
-            "interfaces": interfaces,
-            "connection_summary": connection_summary,
-            "metric_status": {
-                "network_interfaces": {
-                    "status": interface_status,
-                    "reason": (
-                        None
-                        if interface_status == "ok"
-                        else (
-                            "Some interface counters are unavailable "
-                            "or no eligible interfaces were found"
-                        )
-                    ),
-                },
-                "network_connections": connection_status,
-            },
+            "contract_version": self.contract_version,
+            "feature_names": list(self.feature_names),
+            "availability_names": list(self.availability_names),
+            "values": list(self.values),
+            "availability": list(self.availability),
+            "vector": self.vector.tolist(),
         }
 
-    @staticmethod
-    def _collect_connections(
-    ) -> tuple[dict[str, Any] | None, dict[str, str | None]]:
-        """
-        Count visible Internet socket states.
 
-        Connection addresses and process names are not retained.
-        Permission failures produce unavailable data, never a count of zero.
-        """
+def _extract_value(
+    metrics: dict[str, Any],
+    name: str,
+) -> tuple[Any, str | None]:
+    """Read raw values or structured telemetry records."""
 
-        if psutil is None:
-            return None, {
-                "status": "unavailable",
-                "reason": "psutil is not installed",
-            }
+    record = metrics.get(name)
 
-        try:
-            connections = psutil.net_connections(kind="inet")
+    if isinstance(record, dict):
+        status = record.get("status")
+        unit = record.get("unit")
 
-            state_counts: dict[str, int] = {}
-
-            for connection in connections:
-                state = str(
-                    getattr(connection, "status", None) or "UNKNOWN"
-                ).upper()
-
-                state_counts[state] = state_counts.get(state, 0) + 1
-
-            return {
-                "total_visible_connections": len(connections),
-                "states": state_counts,
-                "scope": (
-                    "Connections visible to the current process; "
-                    "results may be permission-limited"
-                ),
-            }, {
-                "status": "ok",
-                "reason": None,
-            }
-
-        except Exception as exc:
-            access_denied = isinstance(exc, PermissionError)
-
-            if psutil is not None:
-                access_denied = access_denied or isinstance(
-                    exc,
-                    getattr(psutil, "AccessDenied", PermissionError),
+        if status == "unavailable":
+            if record.get("value") is not None:
+                raise ValueError(
+                    f"{name}: unavailable measurement must have value=None"
                 )
+            return None, unit
 
-            reason = (
-                "Operating system denied connection inspection"
-                if access_denied
-                else "Connection inspection failed"
+        if status != "ok":
+            raise ValueError(
+                f"{name}: status must be 'ok' or 'unavailable'"
             )
 
-            return None, {
-                "status": "unavailable",
-                "reason": f"{type(exc).__name__}: {reason}",
-            }
+        if unit != UNITS[name]:
+            raise ValueError(
+                f"{name}: expected unit {UNITS[name]!r}, got {unit!r}"
+            )
+
+        return record.get("value"), unit
+
+    # Raw dictionaries use None to represent unavailable measurements.
+    return record, None
 
 
-def propose_network_optimizations(
-    observation: dict[str, Any],
-    *,
-    high_receive_bytes_per_second: float = 50_000_000,
-    high_error_delta: int = 10,
-    high_drop_delta: int = 10,
-) -> list[dict[str, Any]]:
-    """
-    Generate evidence-based recommendations without executing them.
+def _validate_value(name: str, value: Any) -> float | None:
+    """Validate a measurement without confusing zero with missing data."""
 
-    The thresholds are configurable starting points, not universal
-    definitions of network failure.
-    """
+    if value is None:
+        return None
 
-    proposals: list[dict[str, Any]] = []
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be numeric or None")
 
-    interfaces = observation.get("interfaces")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} is not a valid number") from exc
 
-    if not isinstance(interfaces, dict):
-        return proposals
+    if not math.isfinite(numeric):
+        raise ValueError(f"{name} must be finite")
 
-    for interface_name, data in interfaces.items():
+    lower, upper = VALID_RANGES[name]
 
-        if not isinstance(data, dict):
-            continue
-
-        receive_rate = data.get("bytes_recv_per_second")
-
-        if (
-            isinstance(receive_rate, (int, float))
-            and math.isfinite(receive_rate)
-            and receive_rate >= high_receive_bytes_per_second
-        ):
-            proposals.append({
-                "category": "capacity_review",
-                "severity": "info",
-                "interface": interface_name,
-                "evidence": {
-                    "bytes_recv_per_second": receive_rate,
-                    "threshold": high_receive_bytes_per_second,
-                },
-                "recommendation": (
-                    "Verify whether this throughput is expected. "
-                    "Compare application demand and interface capacity "
-                    "before changing configuration."
-                ),
-                "execution": "disabled",
-            })
-
-        checks = (
-            (
-                "errors_in_delta",
-                "receive_errors",
-                high_error_delta,
-                (
-                    "Inspect link health, driver logs, and upstream "
-                    "equipment. Confirm repeated error deltas."
-                ),
-            ),
-            (
-                "errors_out_delta",
-                "transmit_errors",
-                high_error_delta,
-                (
-                    "Inspect link health and driver logs. Confirm "
-                    "repeated transmit-error deltas."
-                ),
-            ),
-            (
-                "drops_in_delta",
-                "receive_drops",
-                high_drop_delta,
-                (
-                    "Check receive queue pressure and host load "
-                    "across multiple samples before tuning buffers."
-                ),
-            ),
-            (
-                "drops_out_delta",
-                "transmit_drops",
-                high_drop_delta,
-                (
-                    "Check transmit queue pressure and congestion "
-                    "across multiple samples before changing queue settings."
-                ),
-            ),
+    if not lower <= numeric <= upper:
+        raise ValueError(
+            f"{name} must be in [{lower}, {upper}], got {numeric}"
         )
 
-        for field, category, threshold, recommendation in checks:
-            value = data.get(field)
+    if name == "network_connections" and not numeric.is_integer():
+        raise ValueError("network_connections must be an integer")
 
-            if isinstance(value, int) and value >= threshold:
-                proposals.append({
-                    "category": category,
-                    "severity": "warning",
-                    "interface": interface_name,
-                    "evidence": {
-                        field: value,
-                        "threshold": threshold,
-                    },
-                    "recommendation": recommendation,
-                    "execution": "disabled",
-                })
+    return numeric
 
-    return proposals
+
+def encode_features(metrics: dict[str, Any]) -> EncodedFeatures:
+    """Encode telemetry into the fixed ten-element model vector.
+
+    Missing measurements:
+      - normalized value = 0.0
+      - availability flag = 0.0
+
+    Measured zero:
+      - normalized value = 0.0
+      - availability flag = 1.0
+
+    This preserves the distinction between missing and measured zero.
+    """
+
+    if not isinstance(metrics, dict):
+        raise TypeError("metrics must be a dictionary")
+
+    normalized_values: list[float] = []
+    actual_values: list[float | None] = []
+    availability: list[int] = []
+
+    for name in FEATURE_NAMES:
+        raw_value, _ = _extract_value(metrics, name)
+        value = _validate_value(name, raw_value)
+
+        is_available = value is not None
+        actual_values.append(value)
+        availability.append(1 if is_available else 0)
+
+        if not is_available:
+            normalized_values.append(0.0)
+            continue
+
+        scale = NORMALIZATION_SCALES[name]
+        normalized = min(1.0, max(0.0, value / scale))
+        normalized_values.append(normalized)
+
+    vector = np.asarray(
+        normalized_values + [float(x) for x in availability],
+        dtype=np.float32,
+    )
+
+    if vector.shape != (FEATURE_DIMENSION,):
+        raise RuntimeError(
+            f"Feature contract produced shape {vector.shape}; "
+            f"expected ({FEATURE_DIMENSION},)"
+        )
+
+    if not np.isfinite(vector).all():
+        raise RuntimeError("Feature contract produced non-finite values")
+
+    if np.any(vector < 0.0) or np.any(vector > 1.0):
+        raise RuntimeError("Feature contract produced values outside [0, 1]")
+
+    return EncodedFeatures(
+        vector=vector,
+        values=tuple(actual_values),
+        availability=tuple(availability),
+        feature_names=FEATURE_NAMES,
+        availability_names=AVAILABILITY_NAMES,
+        contract_version=CONTRACT_VERSION,
+    )
+
+
+def encode_feature_vector(metrics: dict[str, Any]) -> np.ndarray:
+    """Convenience API for policy and model consumers."""
+
+    return encode_features(metrics).vector
+
+
+def feature_contract_metadata() -> dict[str, Any]:
+    """Return serializable metadata for model artifacts and audit records."""
+
+    return {
+        "contract_version": CONTRACT_VERSION,
+        "feature_dimension": FEATURE_DIMENSION,
+        "measurement_dimension": MEASUREMENT_DIMENSION,
+        "feature_names": list(FEATURE_NAMES),
+        "availability_names": list(AVAILABILITY_NAMES),
+        "units": dict(UNITS),
+        "normalization_scales": dict(NORMALIZATION_SCALES),
+        "valid_ranges": {
+            key: list(value)
+            for key, value in VALID_RANGES.items()
+        },
+        "missing_value": 0.0,
+        "availability_encoding": {
+            "available": 1.0,
+            "unavailable": 0.0,
+        },
+    }

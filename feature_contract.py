@@ -1,246 +1,137 @@
-
-"""Authoritative telemetry-to-model feature contract for Asterion.
-
-Model vector layout:
-    [cpu, memory, disk, network_connections, load_1m,
-     cpu_available, memory_available, disk_available,
-     network_connections_available, load_1m_available]
-
-The first five values are normalized to [0, 1].
-The final five values are binary availability indicators.
-"""
+"""Validated network security event and flow ingestion contract."""
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
-from dataclasses import dataclass
-from typing import Any
+from datetime import datetime, timezone
+from typing import Literal
 
-import numpy as np
-
-
-CONTRACT_VERSION = "asterion_telemetry_features_v1"
-FEATURE_DIMENSION = 10
-MEASUREMENT_DIMENSION = 5
-
-# The order here is authoritative. Do not independently reorder features
-# in the agent, API, training environment, or policy adapter.
-FEATURE_NAMES = (
-    "cpu_percent",
-    "memory_percent",
-    "disk_percent",
-    "network_connections",
-    "load_1m",
-)
-
-AVAILABILITY_NAMES = tuple(
-    f"{name}_available" for name in FEATURE_NAMES
-)
-
-# Scales are normalization reference points, not physical maximums.
-NORMALIZATION_SCALES = {
-    "cpu_percent": 100.0,
-    "memory_percent": 100.0,
-    "disk_percent": 100.0,
-    "network_connections": 500.0,
-    "load_1m": 8.0,
-}
-
-UNITS = {
-    "cpu_percent": "%",
-    "memory_percent": "%",
-    "disk_percent": "%",
-    "network_connections": "connections",
-    "load_1m": "load average",
-}
-
-# Validation limits are deliberately distinct from normalization scales.
-# For example, a connection count above 500 is valid; its normalized
-# value is clipped to 1.0 rather than rejected.
-VALID_RANGES = {
-    "cpu_percent": (0.0, 100.0),
-    "memory_percent": (0.0, 100.0),
-    "disk_percent": (0.0, 100.0),
-    "network_connections": (0.0, 10_000_000.0),
-    "load_1m": (0.0, 1_000_000.0),
-}
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-@dataclass(frozen=True)
-class EncodedFeatures:
-    """Encoded model input plus inspectable measurement metadata."""
+class NetworkSecurityRecord(BaseModel):
+    """One timestamped network security event or aggregated flow record.
 
-    vector: np.ndarray
-    values: tuple[float | None, ...]
-    availability: tuple[int, ...]
-    feature_names: tuple[str, ...]
-    availability_names: tuple[str, ...]
-    contract_version: str
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "contract_version": self.contract_version,
-            "feature_names": list(self.feature_names),
-            "availability_names": list(self.availability_names),
-            "values": list(self.values),
-            "availability": list(self.availability),
-            "vector": self.vector.tolist(),
-        }
-
-
-def _extract_value(
-    metrics: dict[str, Any],
-    name: str,
-) -> tuple[Any, str | None]:
-    """Read raw values or structured telemetry records."""
-
-    record = metrics.get(name)
-
-    if isinstance(record, dict):
-        status = record.get("status")
-        unit = record.get("unit")
-
-        if status == "unavailable":
-            if record.get("value") is not None:
-                raise ValueError(
-                    f"{name}: unavailable measurement must have value=None"
-                )
-            return None, unit
-
-        if status != "ok":
-            raise ValueError(
-                f"{name}: status must be 'ok' or 'unavailable'"
-            )
-
-        if unit != UNITS[name]:
-            raise ValueError(
-                f"{name}: expected unit {UNITS[name]!r}, got {unit!r}"
-            )
-
-        return record.get("value"), unit
-
-    # Raw dictionaries use None to represent unavailable measurements.
-    return record, None
-
-
-def _validate_value(name: str, value: Any) -> float | None:
-    """Validate a measurement without confusing zero with missing data."""
-
-    if value is None:
-        return None
-
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{name} must be numeric or None")
-
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{name} is not a valid number") from exc
-
-    if not math.isfinite(numeric):
-        raise ValueError(f"{name} must be finite")
-
-    lower, upper = VALID_RANGES[name]
-
-    if not lower <= numeric <= upper:
-        raise ValueError(
-            f"{name} must be in [{lower}, {upper}], got {numeric}"
-        )
-
-    if name == "network_connections" and not numeric.is_integer():
-        raise ValueError("network_connections must be an integer")
-
-    return numeric
-
-
-def encode_features(metrics: dict[str, Any]) -> EncodedFeatures:
-    """Encode telemetry into the fixed ten-element model vector.
-
-    Missing measurements:
-      - normalized value = 0.0
-      - availability flag = 0.0
-
-    Measured zero:
-      - normalized value = 0.0
-      - availability flag = 1.0
-
-    This preserves the distinction between missing and measured zero.
+    This model validates evidence structure, not whether the event is malicious.
+    Unknown fields are rejected to prevent silent schema drift.
     """
 
-    if not isinstance(metrics, dict):
-        raise TypeError("metrics must be a dictionary")
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
-    normalized_values: list[float] = []
-    actual_values: list[float | None] = []
-    availability: list[int] = []
+    record_id: str = Field(min_length=1, max_length=256)
+    record_type: Literal["security_event", "flow"]
+    timestamp: datetime
+    source_host: str = Field(min_length=1, max_length=255)
 
-    for name in FEATURE_NAMES:
-        raw_value, _ = _extract_value(metrics, name)
-        value = _validate_value(name, raw_value)
+    # Endpoint values are optional: collectors and providers differ in what
+    # they can observe. Missing endpoints are not fabricated.
+    source_ip: str | None = Field(default=None, max_length=64)
+    source_port: int | None = Field(default=None, ge=0, le=65535)
+    destination_ip: str | None = Field(default=None, max_length=64)
+    destination_port: int | None = Field(default=None, ge=0, le=65535)
+    protocol: str | None = Field(default=None, max_length=32)
 
-        is_available = value is not None
-        actual_values.append(value)
-        availability.append(1 if is_available else 0)
+    # A flow can carry counts/bytes; an event may carry a provider-specific
+    # event name. These are observations, not automatic attack verdicts.
+    event_name: str | None = Field(default=None, max_length=256)
+    packets: int | None = Field(default=None, ge=0)
+    bytes_transferred: int | None = Field(default=None, ge=0)
+    duration_seconds: float | None = Field(default=None, ge=0)
 
-        if not is_available:
-            normalized_values.append(0.0)
-            continue
+    # Provenance must say where the record came from and how it was produced.
+    provenance_source: str = Field(min_length=1, max_length=256)
+    provenance_method: str = Field(min_length=1, max_length=256)
+    provider_record_id: str | None = Field(default=None, max_length=256)
+    collector_version: str | None = Field(default=None, max_length=128)
 
-        scale = NORMALIZATION_SCALES[name]
-        normalized = min(1.0, max(0.0, value / scale))
-        normalized_values.append(normalized)
-
-    vector = np.asarray(
-        normalized_values + [float(x) for x in availability],
-        dtype=np.float32,
+    # Preserve unavailable fields explicitly. Example:
+    # {"destination_ip": "not_observed", "protocol": "not_provided"}
+    unavailable_fields: dict[str, str] = Field(default_factory=dict)
+    labels: dict[str, str | int | bool | None] = Field(default_factory=dict)
+    attributes: dict[str, str | int | float | bool | None] = Field(
+        default_factory=dict
     )
 
-    if vector.shape != (FEATURE_DIMENSION,):
-        raise RuntimeError(
-            f"Feature contract produced shape {vector.shape}; "
-            f"expected ({FEATURE_DIMENSION},)"
+    @field_validator("timestamp")
+    @classmethod
+    def require_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("timestamp must include a timezone")
+        return value.astimezone(timezone.utc)
+
+    @field_validator("protocol")
+    @classmethod
+    def normalize_protocol(cls, value: str | None) -> str | None:
+        return value.lower() if value is not None else None
+
+    @field_validator("attributes")
+    @classmethod
+    def require_finite_attributes(
+        cls,
+        value: dict[str, str | int | float | bool | None],
+    ) -> dict[str, str | int | float | bool | None]:
+        for key, item in value.items():
+            if not key.strip():
+                raise ValueError("attribute keys must not be blank")
+            if isinstance(item, float) and not math.isfinite(item):
+                raise ValueError("attributes cannot contain NaN or infinity")
+        return value
+
+    @model_validator(mode="after")
+    def validate_record_type(self) -> "NetworkSecurityRecord":
+        if self.record_type == "security_event" and not self.event_name:
+            raise ValueError(
+                "security_event records require event_name"
+            )
+
+        if self.record_type == "flow":
+            if (
+                self.packets is None
+                and self.bytes_transferred is None
+                and self.duration_seconds is None
+            ):
+                raise ValueError(
+                    "flow records require at least one measured flow quantity"
+                )
+
+        present = {
+            "source_ip": self.source_ip,
+            "source_port": self.source_port,
+            "destination_ip": self.destination_ip,
+            "destination_port": self.destination_port,
+            "protocol": self.protocol,
+        }
+
+        for field_name, reason in self.unavailable_fields.items():
+            if field_name not in present:
+                raise ValueError(
+                    f"unavailable_fields contains unknown field {field_name!r}"
+                )
+            if present[field_name] is not None:
+                raise ValueError(
+                    f"{field_name} has a value and cannot also be unavailable"
+                )
+            if not reason.strip():
+                raise ValueError(
+                    f"unavailability reason for {field_name} cannot be blank"
+                )
+
+        return self
+
+    def canonical_json(self) -> str:
+        """Stable JSON representation for audit and deduplication."""
+        payload = self.model_dump(mode="json")
+        return json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
         )
 
-    if not np.isfinite(vector).all():
-        raise RuntimeError("Feature contract produced non-finite values")
-
-    if np.any(vector < 0.0) or np.any(vector > 1.0):
-        raise RuntimeError("Feature contract produced values outside [0, 1]")
-
-    return EncodedFeatures(
-        vector=vector,
-        values=tuple(actual_values),
-        availability=tuple(availability),
-        feature_names=FEATURE_NAMES,
-        availability_names=AVAILABILITY_NAMES,
-        contract_version=CONTRACT_VERSION,
-    )
-
-
-def encode_feature_vector(metrics: dict[str, Any]) -> np.ndarray:
-    """Convenience API for policy and model consumers."""
-
-    return encode_features(metrics).vector
-
-
-def feature_contract_metadata() -> dict[str, Any]:
-    """Return serializable metadata for model artifacts and audit records."""
-
-    return {
-        "contract_version": CONTRACT_VERSION,
-        "feature_dimension": FEATURE_DIMENSION,
-        "measurement_dimension": MEASUREMENT_DIMENSION,
-        "feature_names": list(FEATURE_NAMES),
-        "availability_names": list(AVAILABILITY_NAMES),
-        "units": dict(UNITS),
-        "normalization_scales": dict(NORMALIZATION_SCALES),
-        "valid_ranges": {
-            key: list(value)
-            for key, value in VALID_RANGES.items()
-        },
-        "missing_value": 0.0,
-        "availability_encoding": {
-            "available": 1.0,
-            "unavailable": 0.0,
-        },
-    }
+    def fingerprint(self) -> str:
+        """Content fingerprint for integrity and duplicate detection."""
+        return hashlib.sha256(
+            self.canonical_json().encode("utf-8")
+        ).hexdigest()

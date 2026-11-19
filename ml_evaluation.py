@@ -1,501 +1,439 @@
 
-"""Reproducible supervised-learning evaluation for Asterion.
+"""Simulation-only transactional adapter with scoped HMAC authorization.
 
-Trains a calibrated text classifier, evaluates it with stratified
-cross-validation and a separate holdout set, and saves an immutable
-candidate artifact with a provenance manifest.
-
-This module never promotes or activates a model.
+This module modifies in-memory simulated state only. It does not access,
+inspect, or modify real hosts. Production/live execution is intentionally
+absent.
 """
 
 from __future__ import annotations
 
-import argparse
-import hashlib
+from dataclasses import dataclass
+from hashlib import sha256
+import hmac
 import json
 import math
-import os
-import tempfile
-import uuid
+import secrets
+import threading
+import time
+from collections.abc import Mapping
+from typing import Any, Callable
 
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any
-
-import joblib
-import numpy as np
-import pandas as pd
-
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (
-    accuracy_score,
-    balanced_accuracy_score,
-    classification_report,
-    confusion_matrix,
-    f1_score,
-    log_loss,
-    precision_score,
-    recall_score,
-)
-from sklearn.model_selection import (
-    StratifiedKFold,
-    cross_validate,
-    train_test_split,
-)
-from sklearn.pipeline import Pipeline
+from .contracts import CandidateAction, SafetyVerdict
 
 
-RANDOM_STATE = 42
-TEST_FRACTION = 0.20
-MAX_FEATURES = 150_000
-MINIMUM_ROWS = 12
-MAX_CV_FOLDS = 5
+SIMULATED_ACTIONS = frozenset({"reduce_noncritical_workload"})
+
+MIN_SECRET_LENGTH = 32
+MIN_TTL_SECONDS = 1
+MAX_TTL_SECONDS = 300
+MAX_SIMULATED_RISK = 0.20
+
+MIN_WORKLOAD_LEVEL = 0.10
+MAX_WORKLOAD_LEVEL = 1.00
+WORKLOAD_REDUCTION = 0.15
 
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+@dataclass(frozen=True)
+class AuthorizationGrant:
+    """Short-lived authorization capability scoped to one target and action."""
+
+    target: str
+    action: str
+    expires_at: int
+    nonce: str
+    signature: str
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
+class AuthorizationAuthority:
+    """Issue and verify short-lived HMAC-signed simulation grants.
 
-    with path.open("rb") as file:
-        for chunk in iter(lambda: file.read(1024 * 1024), b""):
-            digest.update(chunk)
-
-    return digest.hexdigest()
-
-
-def atomic_json_write(data: dict[str, Any], destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{destination.name}.",
-        suffix=".tmp",
-        dir=str(destination.parent),
-    )
-    os.close(descriptor)
-
-    temporary = Path(temporary_name)
-
-    try:
-        temporary.write_text(
-            json.dumps(data, indent=2, allow_nan=False),
-            encoding="utf-8",
-        )
-        os.replace(temporary, destination)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def atomic_joblib_write(artifact: Any, destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{destination.name}.",
-        suffix=".tmp",
-        dir=str(destination.parent),
-    )
-    os.close(descriptor)
-
-    temporary = Path(temporary_name)
-
-    try:
-        joblib.dump(artifact, temporary)
-        os.replace(temporary, destination)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def load_dataset(csv_path: str | Path) -> pd.DataFrame:
-    path = Path(csv_path).expanduser()
-
-    if not path.is_file():
-        raise FileNotFoundError(f"Dataset not found: {path}")
-
-    frame = pd.read_csv(path)
-
-    required = {"text", "label"}
-    missing = required - set(frame.columns)
-
-    if missing:
-        raise ValueError(
-            f"Dataset is missing required columns: {sorted(missing)}"
-        )
-
-    frame = frame[["text", "label"]].dropna().copy()
-
-    frame["text"] = frame["text"].astype(str).str.strip()
-    frame["label"] = frame["label"].astype(str).str.strip()
-
-    frame = frame[
-        (frame["text"] != "")
-        & (frame["label"] != "")
-    ].copy()
-
-    # The same text with conflicting labels is ambiguous training data.
-    conflicts = (
-        frame.groupby("text")["label"]
-        .nunique()
-    )
-    conflicting_texts = conflicts[conflicts > 1]
-
-    if not conflicting_texts.empty:
-        raise ValueError(
-            f"Found {len(conflicting_texts)} text samples with conflicting "
-            "labels. Resolve these labels before training."
-        )
-
-    frame = frame.drop_duplicates(
-        subset=["text", "label"]
-    ).reset_index(drop=True)
-
-    if len(frame) < MINIMUM_ROWS:
-        raise ValueError(
-            f"At least {MINIMUM_ROWS} unique rows are required; "
-            f"found {len(frame)}."
-        )
-
-    counts = frame["label"].value_counts()
-
-    if len(counts) < 2:
-        raise ValueError("At least two distinct labels are required.")
-
-    if counts.min() < 3:
-        raise ValueError(
-            "Every label must have at least three unique samples "
-            "for holdout and cross-validation."
-        )
-
-    return frame
-
-
-def dataset_fingerprint(frame: pd.DataFrame) -> str:
-    """Create an order-independent fingerprint of normalized training data."""
-    records = sorted(
-        (str(row.text), str(row.label))
-        for row in frame.itertuples(index=False)
-    )
-
-    canonical = json.dumps(
-        records,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-
-    return hashlib.sha256(
-        canonical.encode("utf-8")
-    ).hexdigest()
-
-
-def build_model() -> Pipeline:
-    return Pipeline(
-        [
-            (
-                "tfidf",
-                TfidfVectorizer(
-                    ngram_range=(1, 2),
-                    max_features=MAX_FEATURES,
-                    strip_accents="unicode",
-                    sublinear_tf=True,
-                ),
-            ),
-            (
-                "classifier",
-                LogisticRegression(
-                    max_iter=3000,
-                    class_weight="balanced",
-                    random_state=RANDOM_STATE,
-                ),
-            ),
-        ]
-    )
-
-
-def expected_calibration_error(
-    y_true: np.ndarray,
-    probabilities: np.ndarray,
-    bins: int = 10,
-) -> float:
-    """Calculate top-label expected calibration error.
-
-    This is a diagnostic, not proof that probabilities are calibrated.
+    The secret must be generated and managed independently. This in-memory
+    authority is suitable for controlled simulation/testing, not a complete
+    production identity or authorization system.
     """
-    confidence = probabilities.max(axis=1)
-    predictions = probabilities.argmax(axis=1)
 
-    classes = np.arange(probabilities.shape[1])
-    actual_indices = np.array(
-        [np.where(classes == value)[0][0] for value in y_true]
-    )
+    def __init__(self, secret: bytes) -> None:
+        if not isinstance(secret, bytes) or len(secret) < MIN_SECRET_LENGTH:
+            raise ValueError(
+                f"authorization secret must be bytes of at least "
+                f"{MIN_SECRET_LENGTH} bytes"
+            )
 
-    correct = predictions == actual_indices
-    boundaries = np.linspace(0.0, 1.0, bins + 1)
+        self._secret = secret
+        self._used_nonces: set[str] = set()
+        self._lock = threading.Lock()
 
-    error = 0.0
-
-    for index in range(bins):
-        lower = boundaries[index]
-        upper = boundaries[index + 1]
-
-        if index == bins - 1:
-            mask = (confidence >= lower) & (confidence <= upper)
-        else:
-            mask = (confidence >= lower) & (confidence < upper)
-
-        if not np.any(mask):
-            continue
-
-        bin_accuracy = float(correct[mask].mean())
-        bin_confidence = float(confidence[mask].mean())
-
-        error += (
-            float(mask.mean())
-            * abs(bin_accuracy - bin_confidence)
-        )
-
-    return float(error)
-
-
-def train_and_evaluate(
-    csv_path: str | Path,
-    output_directory: str | Path = "artifacts/models/candidates",
-) -> dict[str, Any]:
-    frame = load_dataset(csv_path)
-
-    X = frame["text"]
-    y = frame["label"]
-
-    classes = sorted(y.unique().tolist())
-    number_of_classes = len(classes)
-
-    test_rows = math.ceil(len(frame) * TEST_FRACTION)
-
-    if test_rows < number_of_classes:
-        raise ValueError(
-            "Holdout partition is too small to contain every class. "
-            "Add more labeled samples."
-        )
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y,
-        test_size=test_rows,
-        random_state=RANDOM_STATE,
-        stratify=y,
-    )
-
-    training_counts = y_train.value_counts()
-
-    if training_counts.min() < 2:
-        raise ValueError(
-            "Training partition has too few samples for at least one class."
-        )
-
-    folds = min(
-        MAX_CV_FOLDS,
-        int(training_counts.min()),
-    )
-
-    cv = StratifiedKFold(
-        n_splits=folds,
-        shuffle=True,
-        random_state=RANDOM_STATE,
-    )
-
-    # Cross-validation is performed only on the training partition.
-    cv_results = cross_validate(
-        build_model(),
-        X_train,
-        y_train,
-        cv=cv,
-        scoring={
-            "macro_f1": "f1_macro",
-            "balanced_accuracy": "balanced_accuracy",
-            "accuracy": "accuracy",
-        },
-        return_train_score=False,
-        error_score="raise",
-    )
-
-    cv_metrics = {}
-
-    for metric in (
-        "macro_f1",
-        "balanced_accuracy",
-        "accuracy",
-    ):
-        values = cv_results[f"test_{metric}"]
-
-        cv_metrics[metric] = {
-            "mean": float(np.mean(values)),
-            "standard_deviation": float(np.std(values)),
-            "fold_values": [float(value) for value in values],
+    @staticmethod
+    def _payload(
+        *,
+        target: str,
+        action: str,
+        expires_at: int,
+        nonce: str,
+    ) -> dict[str, Any]:
+        """Construct the canonical fields covered by the signature."""
+        return {
+            "target": target,
+            "action": action,
+            "expires_at": expires_at,
+            "nonce": nonce,
         }
 
-    # Calibrate probabilities using training data only.
-    calibrated_model = CalibratedClassifierCV(
-        estimator=build_model(),
-        method="sigmoid",
-        cv=cv,
-    )
+    def _sign(self, payload: Mapping[str, Any]) -> str:
+        canonical = json.dumps(
+            dict(payload),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
 
-    calibrated_model.fit(X_train, y_train)
+        return hmac.new(
+            self._secret,
+            canonical,
+            sha256,
+        ).hexdigest()
 
-    predictions = calibrated_model.predict(X_test)
-    probabilities = calibrated_model.predict_proba(X_test)
+    def issue(
+        self,
+        *,
+        target: str,
+        action: str,
+        ttl_seconds: int = 60,
+    ) -> AuthorizationGrant:
+        """Issue a grant limited to an allowlisted simulated action."""
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError("target must be a non-empty string")
 
-    holdout_metrics = {
-        "accuracy": float(
-            accuracy_score(y_test, predictions)
-        ),
-        "balanced_accuracy": float(
-            balanced_accuracy_score(y_test, predictions)
-        ),
-        "macro_precision": float(
-            precision_score(
-                y_test,
-                predictions,
-                average="macro",
-                zero_division=0,
-            )
-        ),
-        "macro_recall": float(
-            recall_score(
-                y_test,
-                predictions,
-                average="macro",
-                zero_division=0,
-            )
-        ),
-        "macro_f1": float(
-            f1_score(
-                y_test,
-                predictions,
-                average="macro",
-                zero_division=0,
-            )
-        ),
-        "log_loss": float(
-            log_loss(
-                y_test,
-                probabilities,
-                labels=classes,
-            )
-        ),
-        "expected_calibration_error": expected_calibration_error(
-            np.asarray(
-                [classes.index(label) for label in y_test]
-            ),
-            probabilities,
-        ),
-        "confusion_matrix": confusion_matrix(
-            y_test,
-            predictions,
-            labels=classes,
-        ).tolist(),
-        "classification_report": classification_report(
-            y_test,
-            predictions,
-            labels=classes,
-            target_names=classes,
-            output_dict=True,
-            zero_division=0,
-        ),
-    }
-
-    for value in holdout_metrics.values():
-        if isinstance(value, float) and not math.isfinite(value):
-            raise RuntimeError(
-                "Model evaluation produced a non-finite metric."
+        if action not in SIMULATED_ACTIONS:
+            raise ValueError(
+                "authority only issues grants for allowlisted simulated actions"
             )
 
-    version = (
-        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        + "-"
-        + uuid.uuid4().hex[:8]
-    )
+        if isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, int):
+            raise ValueError("ttl_seconds must be an integer")
 
-    output_directory = Path(output_directory).expanduser()
-    output_directory.mkdir(parents=True, exist_ok=True)
+        if not MIN_TTL_SECONDS <= ttl_seconds <= MAX_TTL_SECONDS:
+            raise ValueError(
+                f"ttl_seconds must be {MIN_TTL_SECONDS}..{MAX_TTL_SECONDS}"
+            )
 
-    model_path = output_directory / f"text-classifier-{version}.joblib"
-    manifest_path = output_directory / f"text-classifier-{version}.json"
+        payload = self._payload(
+            target=target,
+            action=action,
+            expires_at=int(time.time()) + ttl_seconds,
+            nonce=secrets.token_hex(16),
+        )
 
-    dataset_hash = dataset_fingerprint(frame)
+        return AuthorizationGrant(
+            **payload,
+            signature=self._sign(payload),
+        )
 
-    artifact = {
-        "model": calibrated_model,
-        "model_type": "tfidf_logistic_regression_calibrated",
-        "version": version,
-        "classes": classes,
-        "dataset_sha256": dataset_hash,
-        "created_at": utc_now(),
-    }
+    def verify(
+        self,
+        grant: AuthorizationGrant | None,
+        *,
+        target: str,
+        action: str,
+    ) -> tuple[bool, str]:
+        """Verify signature, expiry, scope, allowlist, and single-use nonce."""
+        if grant is None:
+            return False, "missing_authorization_grant"
 
-    atomic_joblib_write(artifact, model_path)
-    model_hash = sha256_file(model_path)
+        if not isinstance(grant, AuthorizationGrant):
+            return False, "invalid_authorization_grant"
 
-    manifest = {
-        "version": version,
-        "created_at": utc_now(),
-        "model_type": artifact["model_type"],
-        "model_sha256": model_hash,
-        "dataset_sha256": dataset_hash,
-        "dataset_rows": int(len(frame)),
-        "training_rows": int(len(X_train)),
-        "holdout_rows": int(len(X_test)),
-        "classes": classes,
-        "random_state": RANDOM_STATE,
-        "cross_validation_folds": folds,
-        "cross_validation": cv_metrics,
-        "holdout": holdout_metrics,
-        "promotion_status": "candidate_only",
-        "promotion_approval_required": True,
-        "live_execution_enabled": False,
-    }
+        if (
+            not isinstance(grant.target, str)
+            or not isinstance(grant.action, str)
+            or not isinstance(grant.nonce, str)
+            or not isinstance(grant.signature, str)
+            or isinstance(grant.expires_at, bool)
+            or not isinstance(grant.expires_at, int)
+        ):
+            return False, "invalid_authorization_grant_fields"
 
-    atomic_json_write(manifest, manifest_path)
+        if not grant.target.strip() or not grant.nonce or not grant.signature:
+            return False, "invalid_authorization_grant_fields"
 
-    return {
-        "version": version,
-        "model_path": str(model_path),
-        "manifest_path": str(manifest_path),
-        "model_sha256": model_hash,
-        "dataset_sha256": dataset_hash,
-        "cross_validation": cv_metrics,
-        "holdout": holdout_metrics,
-        "promotion_status": "candidate_only",
-    }
+        payload = self._payload(
+            target=grant.target,
+            action=grant.action,
+            expires_at=grant.expires_at,
+            nonce=grant.nonce,
+        )
 
+        expected_signature = self._sign(payload)
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Train and evaluate an Asterion ML candidate."
-    )
+        if not hmac.compare_digest(expected_signature, grant.signature):
+            return False, "invalid_grant_signature"
 
-    parser.add_argument(
-        "dataset",
-        help="CSV file containing text and label columns.",
-    )
+        if grant.expires_at <= int(time.time()):
+            return False, "authorization_grant_expired"
 
-    parser.add_argument(
-        "--output",
-        default="artifacts/models/candidates",
-        help="Directory for versioned candidate artifacts.",
-    )
+        if grant.target != target or grant.action != action:
+            return False, "grant_scope_mismatch"
 
-    args = parser.parse_args()
+        if grant.action not in SIMULATED_ACTIONS:
+            return False, "action_not_allowlisted_for_simulation"
 
-    result = train_and_evaluate(
-        args.dataset,
-        args.output,
-    )
+        # The check-and-add is atomic, so concurrent verification attempts
+        # cannot successfully reuse the same grant.
+        with self._lock:
+            if grant.nonce in self._used_nonces:
+                return False, "authorization_grant_replayed"
 
-    print(json.dumps(result, indent=2, allow_nan=False))
+            self._used_nonces.add(grant.nonce)
+
+        return True, "authorized_for_simulation_only"
 
 
-if __name__ == "__main__":
-    main()
+class SimulatedHostAdapter:
+    """Thread-safe in-memory stand-in for a host.
+
+    All state belongs to this Python object. No operating-system, process,
+    network, or remote-host operations are performed.
+    """
+
+    def __init__(
+        self,
+        target: str,
+        workload_level: float = 0.70,
+    ) -> None:
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError("target must be a non-empty string")
+
+        if isinstance(workload_level, bool):
+            raise ValueError("workload_level must be a finite number in [0, 1]")
+
+        try:
+            level = float(workload_level)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "workload_level must be a finite number in [0, 1]"
+            ) from exc
+
+        if (
+            not math.isfinite(level)
+            or not MIN_WORKLOAD_LEVEL <= level <= MAX_WORKLOAD_LEVEL
+        ):
+            raise ValueError("workload_level must be finite and in [0.1, 1.0]")
+
+        self.target = target
+        self._state = {
+            "workload_level": level,
+            "revision": 0,
+        }
+        self._transaction_lock = threading.RLock()
+
+    def snapshot(self) -> dict[str, Any]:
+        """Return a copy of the current simulated state."""
+        with self._transaction_lock:
+            return dict(self._state)
+
+    def apply(self, action: str) -> dict[str, Any]:
+        """Apply the supported simulated action to in-memory state."""
+        if action not in SIMULATED_ACTIONS:
+            raise ValueError("action_not_supported_by_simulator")
+
+        with self._transaction_lock:
+            current_level = self._state["workload_level"]
+
+            if current_level <= MIN_WORKLOAD_LEVEL:
+                raise ValueError("simulated_workload_already_at_minimum")
+
+            next_level = max(
+                MIN_WORKLOAD_LEVEL,
+                current_level - WORKLOAD_REDUCTION,
+            )
+
+            if next_level >= current_level:
+                raise RuntimeError("simulated_state_transition_not_progressing")
+
+            self._state["workload_level"] = next_level
+            self._state["revision"] += 1
+
+            return dict(self._state)
+
+    def restore(self, snapshot: Mapping[str, Any]) -> None:
+        """Restore a previously captured, validated in-memory snapshot."""
+        if not isinstance(snapshot, Mapping):
+            raise ValueError("snapshot must be a mapping")
+
+        level = snapshot.get("workload_level")
+        revision = snapshot.get("revision")
+
+        if (
+            isinstance(level, bool)
+            or not isinstance(level, (int, float))
+            or not math.isfinite(float(level))
+            or not MIN_WORKLOAD_LEVEL <= float(level) <= MAX_WORKLOAD_LEVEL
+        ):
+            raise ValueError("snapshot contains an invalid workload level")
+
+        if (
+            isinstance(revision, bool)
+            or not isinstance(revision, int)
+            or revision < 0
+        ):
+            raise ValueError("snapshot contains an invalid revision")
+
+        if set(snapshot.keys()) != {"workload_level", "revision"}:
+            raise ValueError("snapshot contains unexpected fields")
+
+        with self._transaction_lock:
+            self._state = {
+                "workload_level": float(level),
+                "revision": revision,
+            }
+
+
+class SimulatedTransactionalExecutor:
+    """Execute an authorized action against simulated state with rollback.
+
+    A successful result means only that the in-memory simulation changed.
+    It does not mean a real host action was executed.
+    """
+
+    def __init__(
+        self,
+        authority: AuthorizationAuthority,
+        adapter: SimulatedHostAdapter,
+        fault_hook: Callable[[str], None] | None = None,
+    ) -> None:
+        if not isinstance(authority, AuthorizationAuthority):
+            raise TypeError("authority must be an AuthorizationAuthority")
+
+        if not isinstance(adapter, SimulatedHostAdapter):
+            raise TypeError("adapter must be a SimulatedHostAdapter")
+
+        if fault_hook is not None and not callable(fault_hook):
+            raise TypeError("fault_hook must be callable or None")
+
+        self.authority = authority
+        self.adapter = adapter
+        self.fault_hook = fault_hook or (lambda stage: None)
+
+    @staticmethod
+    def _blocked(reason: str) -> dict[str, Any]:
+        return {
+            "status": "blocked",
+            "executed": False,
+            "live_system_changes": False,
+            "reason": reason,
+        }
+
+    @staticmethod
+    def _valid_candidate_risk(candidate: Any) -> float | None:
+        risk = getattr(candidate, "risk", None)
+
+        if isinstance(risk, bool):
+            return None
+
+        try:
+            value = float(risk)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            return None
+
+        return value
+
+    def execute(
+        self,
+        candidate: CandidateAction,
+        verdict: SafetyVerdict,
+        grant: AuthorizationGrant | None,
+    ) -> dict[str, Any]:
+        """Run the simulated transaction, verifying and rolling back as needed."""
+        if candidate is None:
+            return self._blocked("missing_candidate")
+
+        action = getattr(candidate, "action", None)
+        if not isinstance(action, str) or not action.strip():
+            return self._blocked("invalid_candidate_action")
+
+        if action not in SIMULATED_ACTIONS:
+            return self._blocked("action_not_supported_by_simulator")
+
+        if verdict is None or getattr(verdict, "allowed", None) is not True:
+            return self._blocked("safety_gate_blocked")
+
+        risk = self._valid_candidate_risk(candidate)
+        if risk is None:
+            return self._blocked("invalid_candidate_risk")
+
+        if risk > MAX_SIMULATED_RISK:
+            return self._blocked("simulator_risk_limit_exceeded")
+
+        valid, reason = self.authority.verify(
+            grant,
+            target=self.adapter.target,
+            action=action,
+        )
+
+        if not valid:
+            return self._blocked(reason)
+
+        # Hold the lock across snapshot, mutation, verification, and rollback.
+        # This prevents another transaction using this adapter from interleaving
+        # with the current transaction.
+        with self.adapter._transaction_lock:
+            before = self.adapter.snapshot()
+
+            try:
+                self.fault_hook("before_apply")
+
+                after = self.adapter.apply(action)
+
+                self.fault_hook("after_apply")
+
+                # Verify the expected bounded state transition.
+                valid_transition = (
+                    isinstance(after, dict)
+                    and isinstance(after.get("workload_level"), (int, float))
+                    and not isinstance(after.get("workload_level"), bool)
+                    and math.isfinite(float(after["workload_level"]))
+                    and before["workload_level"] > after["workload_level"]
+                    and MIN_WORKLOAD_LEVEL <= after["workload_level"] <= MAX_WORKLOAD_LEVEL
+                    and after.get("revision") == before["revision"] + 1
+                )
+
+                if not valid_transition:
+                    raise RuntimeError("postcondition_verification_failed")
+
+                self.fault_hook("after_verify")
+
+                return {
+                    "status": "simulated_success",
+                    "executed": True,
+                    "live_system_changes": False,
+                    "execution_mode": "in_memory_simulation",
+                    "before": before,
+                    "after": dict(after),
+                    "rollback": "not_needed",
+                    "rollback_verified": None,
+                }
+
+            except Exception as exc:
+                try:
+                    self.adapter.restore(before)
+                    after_rollback = self.adapter.snapshot()
+                    restored = after_rollback == before
+                except Exception:
+                    restored = False
+                    after_rollback = {"state_unavailable": True}
+
+                return {
+                    "status": "rolled_back" if restored else "rollback_failed",
+                    "executed": True,
+                    "live_system_changes": False,
+                    "execution_mode": "in_memory_simulation",
+                    "error": type(exc).__name__,
+                    "before": before,
+                    "after": after_rollback,
+                    "rollback": "verified" if restored else "failed",
+                    "rollback_verified": restored,
+                }

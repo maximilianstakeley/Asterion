@@ -1,656 +1,710 @@
 
-"""Validated observation-to-decision pipeline with fail-closed safety and audit."""
+"""SQLite persistence for Asterion telemetry and decision records."""
 
-from __future__ import annotations
-from .feature_contract import (
-    CONTRACT_VERSION,
-    encode_features,)
-import logging
-import os
-from pathlib import Path
+import json
+import math
+import hashlib
+import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from uuid import uuid4
-from typing import Any
+from typing import Any, Iterator
 
-from .contracts import Observation, Evidence, DecisionRecord
-from .database import (
-    add_telemetry,
-    add_finding,
-    add_proposal,
-    add_decision_audit,
-)
-from .detection import TextClassifier, detect_anomalies
-from .rootcause import rank_hypotheses
-from .policy import generate_candidates, select_action
-from .configuration import MODEL_DIR
-from .safety import SafetyGate
-from .executor import ActionExecutor
+from .configuration import DB_PATH
 
 
-logger = logging.getLogger(__name__)
-
-_classifier = TextClassifier()
-_safety_gate = SafetyGate()
-_executor = ActionExecutor()
-
-_rl_policy = None
-_rl_policy_error: str | None = None
+SCHEMA = """
+PRAGMA journal_mode=WAL;
 
 
-def _utc_timestamp() -> str:
-    """Return a timezone-aware UTC timestamp."""
+CREATE TABLE IF NOT EXISTS telemetry (
+    id INTEGER PRIMARY KEY,
+    timestamp TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    host TEXT NOT NULL,
+    metrics_json TEXT NOT NULL,
+    collection_status TEXT NOT NULL DEFAULT 'unknown',
+    metric_status_json TEXT NOT NULL DEFAULT '{}');
+
+
+CREATE TABLE IF NOT EXISTS network_security_records (
+    id INTEGER PRIMARY KEY,
+    record_id TEXT NOT NULL UNIQUE,
+    timestamp TEXT NOT NULL,
+    source_host TEXT NOT NULL,
+    record_type TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    record_json TEXT NOT NULL,
+    received_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_network_security_timestamp
+    ON network_security_records(timestamp, id);
+
+CREATE INDEX IF NOT EXISTS idx_network_security_host_timestamp
+    ON network_security_records(source_host, timestamp, id);
+
+
+CREATE INDEX IF NOT EXISTS idx_telemetry_timestamp_id
+    ON telemetry(timestamp, id);
+
+CREATE INDEX IF NOT EXISTS idx_telemetry_host_timestamp
+    ON telemetry(host, timestamp, id);
+
+CREATE TABLE IF NOT EXISTS findings (
+    id INTEGER PRIMARY KEY,
+    timestamp TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    host TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    category TEXT NOT NULL,
+    detail_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS action_proposals (
+    id INTEGER PRIMARY KEY,
+    timestamp TEXT NOT NULL,
+    finding_id INTEGER,
+    action TEXT NOT NULL,
+    risk REAL NOT NULL,
+    status TEXT NOT NULL,
+    rationale TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS experiences (
+    id INTEGER PRIMARY KEY,
+    timestamp TEXT NOT NULL,
+    state_json TEXT NOT NULL,
+    action TEXT NOT NULL,
+    reward REAL NOT NULL,
+    outcome_json TEXT NOT NULL,
+    validated INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS model_registry (
+    id INTEGER PRIMARY KEY,
+    timestamp TEXT NOT NULL,
+    model_path TEXT NOT NULL,
+    model_type TEXT NOT NULL,
+    metrics_json TEXT NOT NULL,
+    promoted INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS decision_audit (
+    decision_id TEXT PRIMARY KEY,
+    timestamp TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    host TEXT NOT NULL,
+    record_json TEXT NOT NULL
+);
+"""
+
+
+def now() -> str:
+    """Return the current UTC timestamp in ISO 8601 format."""
     return datetime.now(timezone.utc).isoformat()
 
 
-def _serialize(value: Any) -> Any:
-    """Convert supported models and containers into JSON-compatible values."""
-    if hasattr(value, "model_dump"):
-        return value.model_dump(mode="json")
+def _validate_json_value(value: Any) -> None:
+    """Reject non-finite floating-point values anywhere in nested data."""
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("NaN and Infinity are not valid telemetry values")
 
     if isinstance(value, dict):
-        return {str(k): _serialize(v) for k, v in value.items()}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError("JSON object keys must be strings")
+            _validate_json_value(item)
 
-    if isinstance(value, (list, tuple)):
-        return [_serialize(item) for item in value]
-
-    if isinstance(value, datetime):
-        return value.isoformat()
-
-    return value
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _validate_json_value(item)
 
 
-def _audit_failure(
-    *,
-    observation: Observation,
-    stage: str,
-    error: Exception | str,
-) -> None:
-    """Persist a failure audit when possible; never conceal the original error."""
-    timestamp = _utc_timestamp()
-    decision_id = str(uuid4())
+def _json_dumps(value: Any) -> str:
+    """Serialize strict JSON while preserving None as null."""
+    _validate_json_value(value)
+    try:
+        return json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Value cannot be serialized as valid JSON: {exc}") from exc
 
-    error_text = (
-        f"{type(error).__name__}: {error}"
-        if isinstance(error, Exception)
-        else str(error)
-    )
 
-    failure_record = {
-        "decision_id": decision_id,
-        "timestamp": timestamp,
-        "agent_id": observation.agent_id,
-        "host": observation.host,
-        "status": "failed",
-        "failure_stage": stage,
-        "error": error_text,
-        "observation": _serialize(observation),
-        "safety": {
-            "execution_permitted": False,
-            "failure_audit_only": True,
-        },
-    }
+@contextmanager
+def connect() -> Iterator[sqlite3.Connection]:
+    """Open a SQLite connection with commit, rollback, and cleanup."""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_PATH), timeout=15)
+    conn.row_factory = sqlite3.Row
 
     try:
-        add_decision_audit(
-            decision_id,
-            timestamp,
-            observation.agent_id,
-            observation.host,
-            failure_record,
-        )
+        yield conn
+        conn.commit()
     except Exception:
-        logger.exception(
-            "Could not persist failure audit for decision %s",
-            decision_id,
-        )
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
-def reload_classifier() -> None:
-    """Reload the text classifier."""
-    global _classifier
-    _classifier = TextClassifier()
+def init_db() -> None:
+    """Create the schema and migrate older telemetry tables safely."""
+    with connect() as conn:
+        conn.executescript(SCHEMA)
 
-
-def reload_rl_policy() -> dict[str, Any]:
-    """Clear cached PPO state so the next selection attempts to load it again."""
-    global _rl_policy, _rl_policy_error
-
-    _rl_policy = None
-    _rl_policy_error = None
-
-    return {
-        "status": "reset",
-        "message": "PPO will be loaded on the next policy-selection request.",
-    }
-
-
-def _get_rl_model_path() -> Path:
-    """Resolve the configured PPO model path."""
-    configured_path = (
-        os.getenv("ASTERION_RL_MODEL")
-        or os.getenv("HUNTERSEEKER_RL_MODEL")
-    )
-
-    if configured_path:
-        return Path(configured_path).expanduser()
-
-    return MODEL_DIR / "rl" / "decision_policy_ppo.zip"
-
-
-def _policy_mode() -> str:
-    """Read the policy mode, preferring the current Asterion variable."""
-    return (
-        os.getenv("ASTERION_POLICY")
-        or os.getenv("HUNTERSEEKER_POLICY")
-        or "baseline"
-    ).strip().lower()
-
-
-def _validate_policy_selection(candidates: list[Any], policy_output: Any) -> Any:
-    """Return the exact matching candidate or reject the policy output."""
-    if not candidates:
-        raise ValueError("No candidate actions were generated.")
-
-    selected_action = getattr(policy_output, "selected_action", None)
-
-    if selected_action is None:
-        raise ValueError("Policy output has no selected_action.")
-
-    matching_candidates = [
-        candidate
-        for candidate in candidates
-        if getattr(candidate, "action", None) == selected_action
-    ]
-
-    if len(matching_candidates) != 1:
-        raise ValueError(
-            "Policy selection must match exactly one generated candidate; "
-            f"selected_action={selected_action!r}, "
-            f"matches={len(matching_candidates)}."
-        )
-
-    return matching_candidates[0]
-
-
-def _select_policy(
-    candidates: list[Any],
-    metrics: dict[str, Any],
-) -> tuple[Any, dict[str, Any]]:
-    """Select a candidate using PPO when configured, otherwise the baseline."""
-    global _rl_policy, _rl_policy_error
-
-    if not candidates:
-        raise ValueError("Cannot select a policy action from an empty candidate list.")
-
-    mode = _policy_mode()
-
-    if mode != "ppo":
-        baseline_output = select_action(candidates)
-        _validate_policy_selection(candidates, baseline_output)
-
-        return baseline_output, {
-            "mode": "baseline",
-            "rl_loaded": False,
+        columns = {
+            row["name"]
+            for row in conn.execute(
+                "PRAGMA table_info(telemetry)"
+            ).fetchall()
         }
 
-    if _rl_policy is None and _rl_policy_error is None:
-        model_path = _get_rl_model_path()
+        if "collection_status" not in columns:
+            conn.execute(
+                """
+                ALTER TABLE telemetry
+                ADD COLUMN collection_status TEXT NOT NULL
+                DEFAULT 'unknown'
+                """
+            )
+
+        if "metric_status_json" not in columns:
+            conn.execute(
+                """
+                ALTER TABLE telemetry
+                ADD COLUMN metric_status_json TEXT NOT NULL
+                DEFAULT '{}'
+                """
+            )
+
+
+
+def add_telemetry(agent, host, metrics):
+    """Store legacy telemetry using the server's insertion timestamp."""
+    if not isinstance(agent, str) or not agent.strip():
+        raise ValueError("agent must be a non-empty string")
+    if not isinstance(host, str) or not host.strip():
+        raise ValueError("host must be a non-empty string")
+    if not isinstance(metrics, dict):
+        raise ValueError("metrics must be a dictionary")
+
+    metrics_json = _json_dumps(metrics)
+
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO telemetry (
+                timestamp, agent_id, host, metrics_json
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (now(), agent, host, metrics_json),
+        )
+        return int(cursor.lastrowid)
+
+
+def add_telemetry_observation(observation: dict) -> int:
+    """Persist telemetry together with collection and metric-level statuses."""
+    if not isinstance(observation, dict):
+        raise ValueError("observation must be a dictionary")
+
+    required = ("timestamp", "agent_id", "host", "metrics")
+    missing = [key for key in required if key not in observation]
+    if missing:
+        raise ValueError(f"Missing observation fields: {missing}")
+
+    timestamp = observation["timestamp"]
+    agent_id = observation["agent_id"]
+    host = observation["host"]
+    metrics = observation["metrics"]
+    collection_status = observation.get("collection_status", "unknown")
+    metric_status = observation.get("metric_status", {})
+
+    for field_name, value in (
+        ("timestamp", timestamp),
+        ("agent_id", agent_id),
+        ("host", host),
+    ):
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{field_name} must be a non-empty string")
+
+    try:
+        parsed_timestamp = datetime.fromisoformat(
+            timestamp.strip().replace("Z", "+00:00")
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "timestamp must be a valid ISO 8601 timestamp"
+        ) from exc
+
+    if parsed_timestamp.tzinfo is None or parsed_timestamp.utcoffset() is None:
+        raise ValueError("timestamp must include a timezone")
+
+    if not isinstance(metrics, dict):
+        raise ValueError("metrics must be a dictionary")
+
+    if collection_status not in {"ok", "partial", "failed", "unknown"}:
+        raise ValueError("Invalid collection_status")
+
+    if not isinstance(metric_status, dict):
+        raise ValueError("metric_status must be a dictionary")
+
+    metrics_json = _json_dumps(metrics)
+    metric_status_json = _json_dumps(metric_status)
+
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO telemetry (
+                timestamp,
+                agent_id,
+                host,
+                metrics_json,
+                collection_status,
+                metric_status_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                timestamp.strip(),
+                agent_id.strip(),
+                host.strip(),
+                metrics_json,
+                collection_status,
+                metric_status_json,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+
+def add_finding(agent, host, severity, category, detail):
+    """Persist a finding."""
+    detail_json = _json_dumps(detail)
+
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO findings (
+                timestamp, agent_id, host, severity, category, detail_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (now(), agent, host, severity, category, detail_json),
+        )
+        return int(cursor.lastrowid)
+
+
+def add_proposal(fid, action, risk, status, rationale):
+    """Persist an action proposal; this does not execute the action."""
+    if not isinstance(risk, (int, float)) or isinstance(risk, bool):
+        raise ValueError("risk must be a finite number")
+    if not math.isfinite(risk):
+        raise ValueError("risk must be a finite number")
+
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO action_proposals (
+                timestamp, finding_id, action, risk, status, rationale
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (now(), fid, action, float(risk), status, rationale),
+        )
+        return int(cursor.lastrowid)
+
+
+def add_experience(state, action, reward, outcome, validated=False):
+    """Persist a recorded experience."""
+    if isinstance(reward, bool) or not isinstance(reward, (int, float)):
+        raise ValueError("reward must be a finite number")
+    if not math.isfinite(reward):
+        raise ValueError("reward must be a finite number")
+
+    state_json = _json_dumps(state)
+    outcome_json = _json_dumps(outcome)
+
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO experiences (
+                timestamp, state_json, action, reward, outcome_json, validated
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                now(),
+                state_json,
+                action,
+                float(reward),
+                outcome_json,
+                int(bool(validated)),
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def get_counts():
+    """Return counts for the primary Asterion persistence tables."""
+    tables = (
+        "telemetry",
+        "findings",
+        "action_proposals",
+        "experiences",
+        "model_registry",
+    )
+
+    with connect() as conn:
+        return {
+            table: conn.execute(
+                f"SELECT COUNT(*) FROM {table}"
+            ).fetchone()[0]
+            for table in tables
+        }
+
+
+def get_findings(limit=50):
+    """Return the newest findings first."""
+    if not 1 <= limit <= 500:
+        raise ValueError("limit must be between 1 and 500")
+
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM findings ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+        return [dict(row) for row in rows]
+
+
+def add_decision_audit(
+    decision_id,
+    timestamp,
+    agent_id,
+    host,
+    record,
+):
+    """Append a decision audit record; duplicate IDs are rejected."""
+    if not all(
+        isinstance(value, str) and value.strip()
+        for value in (decision_id, timestamp, agent_id, host)
+    ):
+        raise ValueError(
+            "decision_id, timestamp, agent_id and host must be non-empty strings"
+        )
+
+    record_json = _json_dumps(record)
+
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO decision_audit (
+                decision_id, timestamp, agent_id, host, record_json
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                decision_id,
+                timestamp,
+                agent_id,
+                host,
+                record_json,
+            ),
+        )
+
+    return decision_id
+
+
+
+def get_decision_audit(limit=50, decision_id=None):
+    """Return audit records with top-level fields and a nested record payload."""
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise ValueError("limit must be an integer")
+    if not 1 <= limit <= 500:
+        raise ValueError("limit must be between 1 and 500")
+
+    if decision_id is not None:
+        if not isinstance(decision_id, str) or not decision_id.strip():
+            raise ValueError("decision_id must be a non-empty string")
+        decision_id = decision_id.strip()
+
+    with connect() as conn:
+        if decision_id is not None:
+            rows = conn.execute(
+                """
+                SELECT decision_id, timestamp, agent_id, host, record_json
+                FROM decision_audit
+                WHERE decision_id = ?
+                ORDER BY timestamp DESC, rowid DESC
+                LIMIT ?
+                """,
+                (decision_id, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT decision_id, timestamp, agent_id, host, record_json
+                FROM decision_audit
+                ORDER BY timestamp DESC, rowid DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+    results = []
+    for row in rows:
+        record = json.loads(row["record_json"])
+
+        if not isinstance(record, dict):
+            record = {"payload": record}
+
+        # Keep the stored record's fields available at the top level.
+        result = dict(record)
+
+        # Database metadata is authoritative.
+        result.update({
+            "decision_id": row["decision_id"],
+            "timestamp": row["timestamp"],
+            "agent_id": row["agent_id"],
+            "host": row["host"],
+            "record": record,
+        })
+
+        results.append(result)
+
+    return results
+
+
+def get_telemetry_timeseries(
+    host: str | None = None,
+    start_time: str | None = None,
+    end_time: str | None = None,
+    limit: int = 1000,
+    agent_id: str | None = None,
+) -> list[dict]:
+    """Return chronological telemetry filtered by host, agent, and time."""
+
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise ValueError("limit must be an integer")
+
+    if not 1 <= limit <= 10000:
+        raise ValueError("limit must be between 1 and 10000")
+
+    clauses = []
+    params = []
+
+    # Filter by machine hostname.
+    if host is not None:
+        if not isinstance(host, str) or not host.strip():
+            raise ValueError("host must be a non-empty string")
+
+        clauses.append("host = ?")
+        params.append(host.strip())
+
+    # Filter by monitoring agent identifier.
+    if agent_id is not None:
+        if not isinstance(agent_id, str) or not agent_id.strip():
+            raise ValueError("agent_id must be a non-empty string")
+
+        clauses.append("agent_id = ?")
+        params.append(agent_id.strip())
+
+    # Validate and normalize timestamps to UTC.
+    normalized_times = {}
+
+    for field, value, operator in (
+        ("start_time", start_time, ">="),
+        ("end_time", end_time, "<="),
+    ):
+        if value is None:
+            continue
+
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{field} must be a non-empty string")
 
         try:
-            from .ReinforcementLearning.interface import (
-                ReinforcementLearningPolicy,
+            parsed = datetime.fromisoformat(
+                value.strip().replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"{field} must be a valid ISO 8601 timestamp"
+            ) from exc
+
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError(
+                f"{field} must include a timezone"
             )
 
-            if not model_path.is_file():
-                raise FileNotFoundError(
-                    f"PPO model file does not exist: {model_path}"
-                )
+        parsed_utc = parsed.astimezone(timezone.utc)
+        normalized_times[field] = parsed_utc
 
-            _rl_policy = ReinforcementLearningPolicy(model_path)
+        clauses.append(f"timestamp {operator} ?")
+        params.append(parsed_utc.isoformat())
 
-        except Exception as exc:
-            _rl_policy_error = f"{type(exc).__name__}: {exc}"
-            logger.exception("PPO policy could not be loaded")
-
-    if _rl_policy is None:
-        baseline_output = select_action(candidates)
-        _validate_policy_selection(candidates, baseline_output)
-
-        # Preserve the existing PolicyOutput contract.
-        from .contracts import PolicyOutput
-
-        fallback_output = PolicyOutput(
-            selected_action=baseline_output.selected_action,
-            confidence=baseline_output.confidence,
-            rationale=(
-                "PPO was requested but unavailable. "
-                "The validated deterministic baseline was used. "
-                f"Load error: {_rl_policy_error}"
-            ),
-            policy_name="deterministic_baseline_fallback",
+    if (
+        "start_time" in normalized_times
+        and "end_time" in normalized_times
+        and normalized_times["start_time"] > normalized_times["end_time"]
+    ):
+        raise ValueError(
+            "start_time must be earlier than or equal to end_time"
         )
 
-        return fallback_output, {
-            "mode": "ppo_requested",
-            "rl_loaded": False,
-            "fallback": "deterministic_baseline",
-            "error": _rl_policy_error,
-        }
-
-    try:
-        policy_output = _rl_policy.select(candidates, metrics)
-        _validate_policy_selection(candidates, policy_output)
-
-    except Exception as exc:
-        # Invalid PPO output must not be silently replaced by candidates[0].
-        # Fall back only through the explicit, validated baseline path.
-        logger.exception("PPO selection failed; using validated baseline")
-
-        baseline_output = select_action(candidates)
-        _validate_policy_selection(candidates, baseline_output)
-
-        from .contracts import PolicyOutput
-
-        fallback_output = PolicyOutput(
-            selected_action=baseline_output.selected_action,
-            confidence=baseline_output.confidence,
-            rationale=(
-                "PPO selection failed. A validated deterministic baseline "
-                f"was used. Selection error: {type(exc).__name__}: {exc}"
-            ),
-            policy_name="deterministic_baseline_fallback",
-        )
-
-        return fallback_output, {
-            "mode": "ppo_selection_fallback",
-            "rl_loaded": True,
-            "fallback": "deterministic_baseline",
-            "error": f"{type(exc).__name__}: {exc}",
-        }
-
-    return policy_output, {
-        "mode": "ppo",
-        "rl_loaded": True,
-    }
-
-
-def _check_resource_budget(candidate: Any) -> bool:
-    """Fail closed until a real resource-budget validator is connected.
-
-    Do not replace this default with True merely to permit actions.
-    Implement and test a real budget check before returning True.
-    """
-    checker = getattr(_safety_gate, "check_resource_budget", None)
-
-    if not callable(checker):
-        logger.warning(
-            "No resource-budget checker is configured; failing closed."
-        )
-        return False
-
-    try:
-        result = checker(candidate)
-        return result is True
-    except Exception:
-        logger.exception("Resource-budget validation failed")
-        return False
-
-
-def _check_preconditions(candidate: Any) -> bool:
-    """Fail closed until a real action-precondition validator is connected."""
-    checker = getattr(_safety_gate, "check_preconditions", None)
-
-    decision_metadata = {
-        "architecture": "asterion_intelligence_v1",
-
-        "temporal_model": {
-            "model_id": None,
-            "status": "shadow_or_unavailable"
-        },
-
-        "anomaly_detector": {
-            "version": "robust_temporal_multivariate_v1"
-        },
-
-        "root_cause": {
-            "method": "evidence_ranked_hypotheses_v1"
-        },
-
-        "policy": {
-            "mode": "deterministic",
-            "model_id": None
-        },
-
-        "feature_contract": "asterion_telemetry_features_v1",
-
-        "execution": {
-            "enabled": False,
-            "dry_run": True
-        }
-    }
-
-    if not callable(checker):
-        logger.warning(
-            "No action-precondition checker is configured; failing closed."
-        )
-        return False
-
-    try:
-        result = checker(candidate)
-        return result is True
-    except Exception:
-        logger.exception("Action-precondition validation failed")
-        return False
-
-
-def _assert_nonexecuting_result(executor_result):
-    """Require affirmative evidence that live execution remained disabled."""
-    metadata = _executor_metadata(executor_result)
-
-    if metadata.get("executed") is True:
-        raise RuntimeError(
-            "Safety contract violation: executor reported executed=True "
-            "while live execution is disabled."
-        )
-
-    if metadata.get("execution_enabled") is True:
-        raise RuntimeError(
-            "Safety contract violation: executor reported "
-            "execution_enabled=True while live execution is disabled."
-        )
-
-    if metadata.get("executed") is not False:
-        raise RuntimeError(
-            "Safety contract violation: executor must explicitly report "
-            "executed=False."
-        )
-
-    if metadata.get("dry_run") is not True:
-        raise RuntimeError(
-            "Safety contract violation: executor must explicitly report "
-            "dry_run=True."
-        )
-
-    if metadata.get("execution_enabled") is not False:
-        raise RuntimeError(
-            "Safety contract violation: executor must explicitly report "
-            "execution_enabled=False."
-        )
-
-    return metadata
-
-
-def _executor_metadata(executor_result: Any) -> dict[str, Any]:
-    """Normalize executor output without assuming that a call executed an action."""
-    result = _serialize(executor_result)
-
-    if isinstance(result, dict):
-        return result
-
-    if result is None:
-        return {"status": "unknown", "result": None}
-
-    return {
-        "status": str(getattr(executor_result, "status", "unknown")),
-        "executed": getattr(executor_result, "executed", None),
-        "dry_run": getattr(executor_result, "dry_run", None),
-        "result": str(result),
-    }
-
-def _proposal_status(verdict: Any, executor_result: Any) -> str:
-    """Derive proposal status from safety and execution evidence."""
-    if getattr(verdict, "allowed", False) is not True:
-        return "blocked"
-
-    metadata = _executor_metadata(executor_result)
-
-    # A positive execution claim requires an explicit result field.
-    if metadata.get("executed") is True:
-        return "executed"
-
-    if metadata.get("dry_run") is True:
-        return "dry_run_only"
-
-    status = str(metadata.get("status", "")).strip().lower()
-
-    if status in {"dry_run", "dry_run_only", "simulated"}:
-        return "dry_run_only"
-
-    if status in {"blocked", "rejected", "failed", "error"}:
-        return status
-
-    # Never claim dry-run or successful execution without evidence.
-    return "executor_status_unknown"
-
-def analyze(
-    agent_id: str,
-    host: str,
-    text: str,
-    metrics: dict[str, Any],
-    *,
-    authorized: bool = False,
-    persist_telemetry: bool = True,
-) -> dict[str, Any]:
-    """Validate, analyze, select, safety-check, and audit one observation."""
-    observation = Observation(
-        agent_id=agent_id,
-        host=host,
-        text=text,
-        metrics=metrics,
+    where = (
+        f"WHERE {' AND '.join(clauses)}"
+        if clauses
+        else ""
     )
 
-    stage = "telemetry_persistence"
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT
+                id,
+                timestamp,
+                agent_id,
+                host,
+                metrics_json,
+                collection_status,
+                metric_status_json
+            FROM (
+                SELECT
+                    id,
+                    timestamp,
+                    agent_id,
+                    host,
+                    metrics_json,
+                    collection_status,
+                    metric_status_json
+                FROM telemetry
+                {where}
+                ORDER BY timestamp DESC, id DESC
+                LIMIT ?
+            ) AS recent
+            ORDER BY timestamp ASC, id ASC
+            """,
+            (*params, limit),
+        ).fetchall()
 
-    try:
-        normalized_metrics = observation.metrics
-        stage = "feature_encoding"
-        encoded_features = encode_features(normalized_metrics)
-
-        if persist_telemetry:
-            add_telemetry(
-                observation.agent_id,
-                observation.host,
-                normalized_metrics,
-            )
-
-        stage = "classification"
-        classification = _classifier.predict(observation.text)
-
-        stage = "anomaly_detection"
-        raw_findings = detect_anomalies(normalized_metrics)
-
-        if (
-            classification.get("available")
-            and classification.get("label", "").lower()
-            in {"malware", "malicious", "intrusion"}
-        ):
-            raw_findings.append(
-                {
-                    "category": "malware_text",
-                    "severity": (
-                        "high"
-                        if classification["confidence"] >= 0.8
-                        else "medium"
-                    ),
-                    "description": (
-                        "Classifier predicts a malicious class; "
-                        "independent validation is required."
-                    ),
-                    "evidence": {
-                        "label": classification["label"],
-                        "confidence": classification["confidence"],
-                    },
-                }
-            )
-
-        stage = "finding_persistence"
-        saved_findings = []
-        evidence = []
-
-        for item in raw_findings:
-            finding_id = add_finding(
-                observation.agent_id,
-                observation.host,
-                item["severity"],
-                item["category"],
-                item,
-            )
-
-            saved_item = {**item, "finding_id": finding_id}
-            saved_findings.append(saved_item)
-
-            evidence.append(
-                Evidence(
-                    source=f"finding:{finding_id}",
-                    category=item["category"],
-                    severity=item["severity"],
-                    description=item["description"],
-                    details=item.get("evidence", {}),
-                )
-            )
-
-        stage = "root_cause_analysis"
-        hypotheses = rank_hypotheses(
-            normalized_metrics,
-            raw_findings,
-            classification,
-        )
-
-        stage = "candidate_generation"
-        candidates = generate_candidates(
-            [_serialize(item) for item in evidence]
-        )
-
-        if not candidates:
-            raise ValueError(
-                "No candidate actions were generated; no action was selected."
-            )
-
-        stage = "policy_selection"
-        policy_output, policy_runtime = _select_policy(
-            candidates,
-            normalized_metrics,
-        )
-
-        # Resolve exactly once. Never silently substitute candidates[0].
-        selected = _validate_policy_selection(candidates, policy_output)
-
-        stage = "safety_evaluation"
-
-        # Both checks default to False unless real validators exist.
-        resource_budget_ok = _check_resource_budget(selected)
-        preconditions_ok = _check_preconditions(selected)
-
-        verdict = _safety_gate.evaluate(
-            selected,
-            authorized=authorized,
-            resource_budget_ok=resource_budget_ok,
-            preconditions_ok=preconditions_ok,
-        )
-
-        stage = "executor_evaluation"
-
-        # The safety gate must deny actions when any required check fails.
-        # ActionExecutor must independently enforce dry-run/no-execution mode.
-
-        executor_result = _executor.execute(selected, verdict)
-        executor_metadata = _assert_nonexecuting_result(executor_result)
-
-        proposal_status = _proposal_status(verdict, executor_result)
-
-        stage = "proposal_persistence"
-
-        if saved_findings:
-            for finding in saved_findings:
-                add_proposal(
-                    finding["finding_id"],
-                    selected.action,
-                    selected.risk,
-                    proposal_status,
-                    selected.rationale,
-                )
-        else:
-            add_proposal(
-                None,
-                selected.action,
-                selected.risk,
-                proposal_status,
-                selected.rationale,
-            )
-
-        stage = "decision_audit"
-
-        timestamp = _utc_timestamp()
-        decision_id = str(uuid4())
-
-        record = DecisionRecord(
-            decision_id=decision_id,
-            timestamp=timestamp,
-            agent_id=observation.agent_id,
-            host=observation.host,
-            observation=_serialize(observation),
-            model_outputs={
-                "text_classifier": classification,
-                "telemetry_features": encoded_features.as_dict(),
-                "feature_contract_version": CONTRACT_VERSION,
-                "policy_runtime": policy_runtime,
-                "root_cause_hypotheses": _serialize(hypotheses),
-                "rl_state_mapping": (
-                    "normalized_cpu_memory_disk_connections_load_v1"
-                ),
-            },
-            evidence=evidence,
-            candidate_actions=candidates,
-            policy_output=policy_output,
-            safety_verdict=verdict,
-            executor_result=executor_result,
-        )
-
-        serialized = record.model_dump(mode="json")
-
-        add_decision_audit(
-            decision_id,
-            timestamp,
-            observation.agent_id,
-            observation.host,
-            serialized,)
-
-        return {
-            "decision": serialized,
-            "anomalies": saved_findings,
-            "root_cause_hypotheses": _serialize(hypotheses),
-            "action_proposals": [
-                {
-                    "action": candidate.action,
-                    "risk": candidate.risk,
-                    "rationale": candidate.rationale,
-                    "selected": candidate is selected,
-                }
-                for candidate in candidates
-            ],
-            "safety": {
-                "verdict": verdict.verdict,
-                "allowed": verdict.allowed,
-                "reasons": verdict.reasons,
-                "resource_budget_ok": resource_budget_ok,
-                "preconditions_ok": preconditions_ok,
-                "executor_result": executor_metadata,
-                "proposal_status": proposal_status,
-                "no_actions_executed": True,
-            },
+    return [
+        {
+            "id": row["id"],
+            "timestamp": row["timestamp"],
+            "agent_id": row["agent_id"],
+            "host": row["host"],
+            "collection_status": row["collection_status"],
+            "metric_status": json.loads(row["metric_status_json"]),
+            "metrics": json.loads(row["metrics_json"]),
         }
+        for row in rows
+    ]
 
-    except Exception as exc:
-        logger.exception(
-            "Decision pipeline failed at stage %s for host %s",
-            stage,
-            observation.host,
+
+def add_network_security_record(record: dict) -> int:
+    """Persist a validated network security record.
+
+    The caller should validate the payload with NetworkSecurityRecord before
+    calling this function. Duplicate record IDs are rejected, not overwritten.
+    """
+    import hashlib
+    import json
+
+    if not isinstance(record, dict):
+        raise ValueError("record must be a dictionary")
+
+    required = ("record_id", "timestamp", "source_host", "record_type")
+    missing = [name for name in required if name not in record]
+    if missing:
+        raise ValueError(f"Missing record fields: {missing}")
+
+    canonical = json.dumps(
+        record,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    fingerprint = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO network_security_records (
+                record_id, timestamp, source_host, record_type,
+                fingerprint, record_json, received_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record["record_id"],
+                record["timestamp"],
+                record["source_host"],
+                record["record_type"],
+                fingerprint,
+                canonical,
+                now(),
+            ),
         )
+        return int(cursor.lastrowid)
 
-        _audit_failure(
-            observation=observation,
-            stage=stage,
-            error=exc,
-        )
 
-        raise
+def get_network_security_records(
+    *,
+    source_host: str | None = None,
+    start_timestamp: str | None = None,
+    end_timestamp: str | None = None,
+    limit: int = 500,
+) -> list[dict]:
+    """Read stored network security records in event-time order."""
+    if not 1 <= limit <= 5000:
+        raise ValueError("limit must be between 1 and 5000")
+
+    clauses = []
+    parameters: list[object] = []
+
+    if source_host is not None:
+        clauses.append("source_host = ?")
+        parameters.append(source_host)
+
+    if start_timestamp is not None:
+        clauses.append("timestamp >= ?")
+        parameters.append(start_timestamp)
+
+    if end_timestamp is not None:
+        clauses.append("timestamp <= ?")
+        parameters.append(end_timestamp)
+
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    parameters.append(limit)
+
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT id, record_id, timestamp, source_host, record_type,
+                   fingerprint, record_json, received_at
+            FROM network_security_records
+            {where}
+            ORDER BY timestamp ASC, id ASC
+            LIMIT ?
+            """,
+            parameters,
+        ).fetchall()
+
+    return [
+        {
+            "id": row["id"],
+            "record_id": row["record_id"],
+            "timestamp": row["timestamp"],
+            "source_host": row["source_host"],
+            "record_type": row["record_type"],
+            "fingerprint": row["fingerprint"],
+            "record": json.loads(row["record_json"]),
+            "received_at": row["received_at"],
+        }
+        for row in rows]
+
+
