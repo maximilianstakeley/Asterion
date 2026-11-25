@@ -1,537 +1,547 @@
+"""Stage 2 time-window and multivariate telemetry detection.
 
-"""Asterion decision pipeline: diagnosis, constrained selection, safety, audit.
+A finding is an investigation signal, not proof of malicious activity.
 
-This module never executes operating-system commands.
-Live action execution is deliberately blocked.
-Simulation requires an explicitly supplied simulator.
+Feature policy:
+- Only finite numeric values explicitly marked available are measurements.
+- Missing values are never imputed as zero.
+- Time-window calculations use actual timestamps, not assumed sample spacing.
+- Rates are not computed across excessive gaps or non-positive time deltas.
+- Multivariate scores use robust median/MAD normalization.
+- A score is not a calibrated probability of intrusion.
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
 import math
-import sqlite3
-import time
-from dataclasses import asdict, dataclass
-from pathlib import Path
-from typing import Any, Callable, Iterable
+from datetime import datetime, timezone
+from statistics import median
+from typing import Any, Iterable
 
 
-SCHEMA_VERSION = 1
-LIVE_EXECUTION_ENABLED = False
+DEFAULT_METRICS = (
+    "cpu_percent",
+    "memory_percent",
+    "disk_percent",
+    "load_1m",
+    "network_bytes_per_sec",
+    "network_packets_per_sec",)
 
-ALLOWED_ACTIONS = {
-    "collect_diagnostics",
-    "increase_observation_frequency",
-    "reduce_optional_workload",
-    "scale_resource_simulated",
-    "isolate_host_simulated",
-    "no_op",
-}
+DEFAULT_THRESHOLDS = {
+    "cpu_percent": 90.0,
+    "memory_percent": 90.0,
+    "disk_percent": 95.0,}
 
-# These are illustrative mappings, not proof of causality.
-CATEGORY_RULES = {
-    "resource_threshold": (
-        "resource_pressure",
-        "Resource utilization exceeded a configured threshold.",
-    ),
-    "abrupt_metric_change": (
-        "rapid_state_change",
-        "A measured system metric changed unusually quickly.",
-    ),
-    "persistent_threshold_violation": (
-        "persistent_resource_pressure",
-        "A resource threshold appears to have been breached repeatedly.",
-    ),
-    "multivariate_baseline_deviation": (
-        "multivariate_anomaly",
-        "Several measurements differ from the supplied baseline.",
-    ),
-    "security_indicator": (
-        "security_signal",
-        "A security event or configured indicator requires investigation.",
-    ),
-    "network_intrusion": (
-        "network_security_signal",
-        "A network security detector reported a possible intrusion.",
-    ),
-}
+# Conservative defaults. Configure these for the collection interval and host.
+DEFAULT_WINDOW_SECONDS = 300.0
+DEFAULT_MIN_SAMPLES = 3
+DEFAULT_MAX_GAP_SECONDS = 120.0
+DEFAULT_PERSISTENCE_FRACTION = 0.60
+DEFAULT_REPEATED_ANOMALY_MINIMUM = 3
+DEFAULT_RATE_THRESHOLDS_PER_SECOND = {
+    "cpu_percent": 0.50,
+    "memory_percent": 0.50,
+    "disk_percent": 0.25,}
 
+def _timestamp(value: Any) -> datetime | None:
+    """Parse a timezone-aware datetime or ISO-8601 timestamp."""
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
 
-def _canonical(value: Any) -> str:
-    """Stable JSON representation for reproducibility and hashing."""
-    return json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    )
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+
+    return parsed.astimezone(timezone.utc)
 
 
-def _finite_number(value: Any) -> bool:
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(value)
-    )
+def _metric_value(metrics: Any, key: str) -> float | None:
+    """Read finite available metrics, including defined network-rate aliases."""
+    if not isinstance(metrics, dict):
+        return None
+
+    raw = metrics.get(key)
+
+    # Derive total network throughput only when both directional rates exist.
+    # Do not interpret an unavailable direction as zero.
+    if key in {"network_bytes_per_sec", "network_packets_per_sec"}:
+        network_io = metrics.get("network_io")
+        if isinstance(network_io, dict) and network_io.get("status", "ok") == "ok":
+            rates = network_io.get("rates")
+            if isinstance(rates, dict):
+                if key == "network_bytes_per_sec":
+                    directional = (
+                        rates.get("bytes_sent_per_sec"),
+                        rates.get("bytes_recv_per_sec"),
+                    )
+                else:
+                    directional = (
+                        rates.get("packets_sent_per_sec"),
+                        rates.get("packets_recv_per_sec"),
+                    )
+
+                if all(
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(float(value))
+                    and value >= 0
+                    for value in directional
+                ):
+                    return float(directional[0]) + float(directional[1])
+
+    if key not in metrics:
+        return None
+
+    raw = metrics[key]
+
+    if isinstance(raw, dict):
+        if raw.get("status", "ok") != "ok":
+            return None
+        raw = raw.get("value")
+
+    if raw is None or isinstance(raw, bool):
+        return None
+
+    if not isinstance(raw, (int, float)):
+        return None
+
+    value = float(raw)
+    return value if math.isfinite(value) else None
 
 
-def _severity_weight(severity: Any) -> float:
-    return {
-        "critical": 1.0,
-        "high": 0.8,
-        "medium": 0.55,
-        "low": 0.3,
-        "info": 0.1,
-    }.get(str(severity).lower(), 0.2)
+def _normalise_sample(sample: dict[str, Any]) -> dict[str, Any] | None:
+    """Validate the identity and timestamp of a telemetry sample."""
+    if not isinstance(sample, dict):
+        return None
 
+    host = sample.get("host")
+    timestamp = _timestamp(sample.get("timestamp"))
+    metrics = sample.get("metrics")
 
-def _stable_id(prefix: str, payload: Any) -> str:
-    digest = hashlib.sha256(_canonical(payload).encode("utf-8")).hexdigest()
-    return f"{prefix}_{digest[:16]}"
-
-
-def diagnose(findings: Iterable[dict[str, Any]]) -> dict[str, Any]:
-    """Group detector findings into ranked, explicitly provisional hypotheses."""
-    items = list(findings)
-    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
-
-    for index, finding in enumerate(items):
-        if not isinstance(finding, dict):
-            continue
-
-        category = finding.get("category")
-        rule = CATEGORY_RULES.get(str(category))
-        if not rule:
-            continue
-
-        hypothesis_type, explanation = rule
-        host = str(finding.get("host") or "unknown-host")
-        groups.setdefault((host, hypothesis_type), []).append({
-            "finding_index": index,
-            "finding_id": finding.get("finding_id"),
-            "category": category,
-            "severity": finding.get("severity", "unknown"),
-            "timestamp": finding.get("timestamp"),
-            "evidence": finding.get("evidence", {}),
-        })
-
-    hypotheses = []
-    for (host, hypothesis_type), evidence_items in groups.items():
-        # This is a transparent ranking heuristic, not a calibrated probability.
-        weights = [
-            _severity_weight(item.get("severity"))
-            for item in evidence_items
-        ]
-        score = min(1.0, sum(weights) / max(1, len(weights)) *
-                    min(1.0, len(weights) / 3.0))
-
-        supporting = [item["finding_index"] for item in evidence_items]
-        hypothesis = {
-            "host": host,
-            "hypothesis_type": hypothesis_type,
-            "explanation": next(
-                explanation
-                for category, (kind, explanation) in CATEGORY_RULES.items()
-                if kind == hypothesis_type
-            ),
-            "ranking_score": round(score, 4),
-            "score_semantics": (
-                "Heuristic priority score; not a probability or proof of cause."
-            ),
-            "supporting_evidence": evidence_items,
-            "contradictory_evidence": [],
-            "uncertainty": (
-                "Causal relationships have not been established. "
-                "Correlated findings may share one underlying cause."
-            ),
-        }
-        hypothesis["hypothesis_id"] = _stable_id("hyp", hypothesis)
-        hypotheses.append(hypothesis)
-
-    hypotheses.sort(
-        key=lambda item: (item["ranking_score"], item["hypothesis_type"]),
-        reverse=True,
-    )
+    if not isinstance(host, str) or not host.strip():
+        return None
+    if timestamp is None or not isinstance(metrics, dict):
+        return None
 
     return {
-        "schema_version": SCHEMA_VERSION,
-        "input_finding_count": len(items),
-        "hypotheses": hypotheses,
-    }
+        **sample,
+        "host": host.strip(),
+        "_timestamp": timestamp,
+        "metrics": metrics,}
 
 
-@dataclass(frozen=True)
-class ActionCandidate:
-    action_id: str
-    target_host: str
-    rationale: str
-    expected_benefit: float
-    estimated_risk: float
-    reversible: bool
-    requires_authorization: bool = True
-
-    def validate(self) -> None:
-        if self.action_id not in ALLOWED_ACTIONS:
-            raise ValueError(f"Action is not allowlisted: {self.action_id}")
-        if not self.target_host or self.target_host == "unknown-host":
-            raise ValueError("Action requires a known target host")
-        if not _finite_number(self.expected_benefit):
-            raise ValueError("expected_benefit must be finite")
-        if not _finite_number(self.estimated_risk):
-            raise ValueError("estimated_risk must be finite")
-        if not 0 <= self.expected_benefit <= 1:
-            raise ValueError("expected_benefit must be between 0 and 1")
-        if not 0 <= self.estimated_risk <= 1:
-            raise ValueError("estimated_risk must be between 0 and 1")
-
-
-def generate_candidates(
-    hypotheses: dict[str, Any],
-) -> list[ActionCandidate]:
-    """Generate conservative candidates; does not execute them."""
-    candidates: list[ActionCandidate] = []
-
-    for hypothesis in hypotheses.get("hypotheses", []):
-        host = hypothesis.get("host")
-        kind = hypothesis.get("hypothesis_type")
-
-        # Read-only diagnostics are preferred as an initial response.
-        candidates.append(ActionCandidate(
-            action_id="collect_diagnostics",
-            target_host=host,
-            rationale=f"Collect additional evidence for {kind}.",
-            expected_benefit=0.45,
-            estimated_risk=0.05,
-            reversible=True,
-        ))
-
-        if kind in {
-            "resource_pressure",
-            "persistent_resource_pressure",
-            "rapid_state_change",
-            "multivariate_anomaly",
-        }:
-            candidates.append(ActionCandidate(
-                action_id="increase_observation_frequency",
-                target_host=host,
-                rationale="Gather more frequent measurements to characterize the event.",
-                expected_benefit=0.35,
-                estimated_risk=0.08,
-                reversible=True,
-            ))
-
-        if kind in {"resource_pressure", "persistent_resource_pressure"}:
-            candidates.append(ActionCandidate(
-                action_id="reduce_optional_workload",
-                target_host=host,
-                rationale="Candidate for reducing optional workload after authorization.",
-                expected_benefit=0.55,
-                estimated_risk=0.35,
-                reversible=True,
-            ))
-            candidates.append(ActionCandidate(
-                action_id="scale_resource_simulated",
-                target_host=host,
-                rationale="Evaluate resource scaling in simulation before considering deployment.",
-                expected_benefit=0.65,
-                estimated_risk=0.2,
-                reversible=True,
-            ))
-
-        if kind in {"security_signal", "network_security_signal"}:
-            candidates.append(ActionCandidate(
-                action_id="isolate_host_simulated",
-                target_host=host,
-                rationale="Evaluate host isolation in simulation; this signal alone does not authorize isolation.",
-                expected_benefit=0.7,
-                estimated_risk=0.8,
-                reversible=False,
-            ))
-
-    candidates.append(ActionCandidate(
-        action_id="no_op",
-        target_host="system",
-        rationale="Take no corrective action while collecting or reviewing evidence.",
-        expected_benefit=0.0,
-        estimated_risk=0.0,
-        reversible=True,
-        requires_authorization=False,
-    ))
-
-    return candidates
-
-
-def _candidate_score(candidate: ActionCandidate, risk_weight: float) -> float:
-    return candidate.expected_benefit - risk_weight * candidate.estimated_risk
-
-
-def select_action(
-    candidates: Iterable[ActionCandidate],
+def detect_time_window(
+    samples: Iterable[dict[str, Any]],
     *,
-    authorized_hosts: set[str] | None = None,
-    max_risk: float = 0.25,
-    risk_weight: float = 1.0,
-    learned_proposal: str | None = None,
-) -> dict[str, Any]:
-    """Select a safe candidate; a learned policy can only suggest an allowlisted ID."""
-    if not _finite_number(max_risk) or not 0 <= max_risk <= 1:
-        raise ValueError("max_risk must be between 0 and 1")
-    if not _finite_number(risk_weight) or risk_weight < 0:
-        raise ValueError("risk_weight must be finite and nonnegative")
+    window_seconds: float = DEFAULT_WINDOW_SECONDS,
+    min_samples: int = DEFAULT_MIN_SAMPLES,
+    max_gap_seconds: float = DEFAULT_MAX_GAP_SECONDS,
+    persistence_fraction: float = DEFAULT_PERSISTENCE_FRACTION,
+    repeated_anomaly_minimum: int = DEFAULT_REPEATED_ANOMALY_MINIMUM,
+    thresholds: dict[str, float] | None = None,
+    rate_thresholds_per_second: dict[str, float] | None = None,
+) -> list[dict[str, Any]]:
+    """Evaluate persistence, rate of change, and repeated threshold anomalies.
 
-    candidates = list(candidates)
-    eligible: list[ActionCandidate] = []
+    The analysis is performed separately for each host and uses a trailing
+    window ending at that host's latest valid sample.
 
-    for candidate in candidates:
-        candidate.validate()
-        if candidate.estimated_risk > max_risk:
-            continue
-        if candidate.requires_authorization:
-            if authorized_hosts is None:
-                continue
-            if candidate.target_host not in authorized_hosts:
-                continue
-        eligible.append(candidate)
-
-    # A policy proposal cannot override the risk cap or authorization.
-    proposal_used = False
-    if learned_proposal:
-        proposed = [
-            candidate for candidate in eligible
-            if candidate.action_id == learned_proposal
-        ]
-        if proposed:
-            eligible = proposed
-            proposal_used = True
-
-    if not eligible:
-        return {
-            "selected_action": "no_op",
-            "target_host": None,
-            "selection_score": 0.0,
-            "selection_reason": "No candidate satisfied the configured safety constraints.",
-            "learned_proposal_used": False,
-        }
-
-    selected = max(
-        eligible,
-        key=lambda item: (
-            _candidate_score(item, risk_weight),
-            item.action_id == "no_op",
-        ),
-    )
-
-    return {
-        "selected_action": selected.action_id,
-        "target_host": selected.target_host,
-        "selection_score": round(_candidate_score(selected, risk_weight), 4),
-        "selection_reason": selected.rationale,
-        "expected_benefit": selected.expected_benefit,
-        "estimated_risk": selected.estimated_risk,
-        "reversible": selected.reversible,
-        "learned_proposal_used": proposal_used,
-        "action_execution": "disabled",}
-
-
-def safety_gate(
-    decision: dict[str, Any],
-    *,
-    authorized_hosts: set[str],
-    max_risk: float = 0.25,
-    live_execution_enabled: bool = LIVE_EXECUTION_ENABLED,
-    simulation_mode: bool = False,
-) -> dict[str, Any]:
-    """Validate authorization and risk without performing any action."""
-    action_id = decision.get("selected_action")
-    target = decision.get("target_host")
-    risk = decision.get("estimated_risk")
-    reasons = []
-
-    if action_id not in ALLOWED_ACTIONS:
-        reasons.append("action_not_allowlisted")
-
-    if action_id != "no_op" and target not in authorized_hosts:
-        reasons.append("target_not_authorized")
-
-    if not _finite_number(risk) or not 0 <= risk <= max_risk:
-        reasons.append("risk_limit_exceeded")
-
-    # Simulation is not permission to execute against a live host.
-    if not simulation_mode and not live_execution_enabled:
-        reasons.append("live_execution_disabled")
-
-    if simulation_mode and action_id in {
-        "reduce_optional_workload",
-        "scale_resource_simulated",
-        "isolate_host_simulated",
-    }:
-        if action_id not in {"scale_resource_simulated", "isolate_host_simulated"}:
-            reasons.append("action_not_approved_for_simulation")
-
-    return {
-        "approved": len(reasons) == 0,
-        "action_id": action_id,
-        "target_host": target,
-        "reasons": reasons,
-        "simulation_mode": simulation_mode,
-        "live_execution_enabled": live_execution_enabled, }
-
-def execute_action(
-    decision: dict[str, Any],
-    gate: dict[str, Any],
-    *,
-    simulation: bool = False,
-    simulator: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    """Live execution is impossible here. Simulation requires an explicit adapter."""
-    if not simulation:
-        return {
-            "status": "blocked",
-            "reason": "live_execution_disabled",
-            "action_execution": "disabled",}
-
-    if decision.get("selected_action") not in ALLOWED_ACTIONS:
-        return {"status": "blocked", "reason": "action_not_allowlisted"}
-
-    if simulator is None:
-        return {
-            "status": "blocked",
-            "reason": "simulation_adapter_required",}
-
-    # A simulated action still requires explicit authorization and a risk gate.
-    if not gate.get("approved"):
-        return {
-            "status": "blocked",
-            "reason": "safety_gate_rejected",
-            "gate_reasons": gate.get("reasons", []),}
-
-    result = simulator(dict(decision))
-    if not isinstance(result, dict) or "status" not in result:
-        return {
-            "status": "invalid_simulator_result",
-            "reason": "simulator_must_return_a_status",}
-
-    return {
-        "status": "simulated",
-        "simulator_result": result,
-        "action_execution": "simulated_only",}
-
-
-class AuditLedger:
-    """SQLite hash-linked audit log for decisions and feedback.
-
-    The hash chain detects modifications to stored records. It is not a
-    substitute for filesystem access control, backups, or signed checkpoints.
+    Missing samples are counted as missing, not normal. Large sampling gaps
+    break rate-of-change sequences. A finding includes coverage metadata so
+    sparse data cannot silently look like a clean window.
     """
+    for name, value in (
+        ("window_seconds", window_seconds),
+        ("max_gap_seconds", max_gap_seconds),
+        ("persistence_fraction", persistence_fraction),
+    ):
+        if not math.isfinite(float(value)):
+            raise ValueError(f"{name} must be finite")
 
-    def __init__(self, path: str | Path):
-        self.path = str(path)
-        with self._connect() as connection:
-            connection.execute("""
-                CREATE TABLE IF NOT EXISTS audit_records (
-                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                    created_at REAL NOT NULL,
-                    record_type TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    previous_hash TEXT NOT NULL,
-                    record_hash TEXT NOT NULL UNIQUE
-                )
-            """)
+    if window_seconds <= 0 or max_gap_seconds <= 0:
+        raise ValueError("window_seconds and max_gap_seconds must be positive")
+    if min_samples < 2:
+        raise ValueError("min_samples must be at least 2")
+    if not 0 < persistence_fraction <= 1:
+        raise ValueError("persistence_fraction must be in (0, 1]")
+    if repeated_anomaly_minimum < 2:
+        raise ValueError("repeated_anomaly_minimum must be at least 2")
 
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=10)
-        connection.execute("PRAGMA foreign_keys = ON")
-        return connection
+    active_thresholds = dict(DEFAULT_THRESHOLDS)
+    if thresholds:
+        active_thresholds.update(thresholds)
 
-    def append(self, record_type: str, payload: dict[str, Any]) -> str:
-        if not record_type or not isinstance(payload, dict):
-            raise ValueError("record_type and dictionary payload are required")
+    active_rate_thresholds = dict(DEFAULT_RATE_THRESHOLDS_PER_SECOND)
+    if rate_thresholds_per_second:
+        active_rate_thresholds.update(rate_thresholds_per_second)
 
-        payload_json = _canonical(payload)
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT sequence, record_hash FROM audit_records "
-                "ORDER BY sequence DESC LIMIT 1"
-            ).fetchone()
-            previous_hash = row[1] if row else "GENESIS"
-            created_at = time.time()
-            body = {
-                "created_at": created_at,
-                "record_type": record_type,
-                "payload_json": payload_json,
-                "previous_hash": previous_hash,
-            }
-            record_hash = hashlib.sha256(
-                _canonical(body).encode("utf-8")
-            ).hexdigest()
-            connection.execute(
-                """INSERT INTO audit_records
-                (created_at, record_type, payload_json, previous_hash, record_hash)
-                VALUES (?, ?, ?, ?, ?)""",
-                (created_at, record_type, payload_json, previous_hash, record_hash),
+    grouped: dict[str, list[dict[str, Any]]] = {}
+
+    for raw_sample in samples:
+        sample = _normalise_sample(raw_sample)
+        if sample is None:
+            continue
+        grouped.setdefault(sample["host"], []).append(sample)
+
+    findings: list[dict[str, Any]] = []
+
+    for host, host_samples in grouped.items():
+        host_samples.sort(key=lambda row: row["_timestamp"])
+        end = host_samples[-1]["_timestamp"]
+        start = end.timestamp() - window_seconds
+
+        window = [
+            row for row in host_samples
+            if start <= row["_timestamp"].timestamp() <= end.timestamp()
+        ]
+
+        if not window:
+            continue
+
+        for metric, threshold in active_thresholds.items():
+            if not math.isfinite(float(threshold)):
+                raise ValueError(f"Threshold for {metric} must be finite")
+
+            measured = [
+                (row["_timestamp"], _metric_value(row["metrics"], metric))
+                for row in window
+            ]
+            available = [(ts, value) for ts, value in measured if value is not None]
+            exceedances = [
+                (ts, value) for ts, value in available if value >= threshold
+            ]
+
+            coverage = len(available) / len(window)
+            persistence = (
+                len(exceedances) / len(available) if available else None
             )
-        return record_hash
 
-    def verify(self) -> dict[str, Any]:
-        expected_previous = "GENESIS"
-        checked = 0
-        with self._connect() as connection:
-            rows = connection.execute(
-                """SELECT created_at, record_type, payload_json,
-                          previous_hash, record_hash
-                   FROM audit_records ORDER BY sequence"""
-            ).fetchall()
+            if len(available) >= min_samples and persistence is not None:
+                if (
+                    len(exceedances) >= min_samples
+                    and persistence >= persistence_fraction
+                ):
+                    findings.append({
+                        "category": "persistent_threshold",
+                        "severity": "high" if persistence >= 0.90 else "medium",
+                        "description": (
+                            f"{metric} remained above its configured threshold "
+                            "for a substantial fraction of the observed window."
+                        ),
+                        "host": host,
+                        "evidence": {
+                            "metric": metric,
+                            "threshold": threshold,
+                            "window_seconds": window_seconds,
+                            "window_start": window[0]["_timestamp"].isoformat(),
+                            "window_end": end.isoformat(),
+                            "available_samples": len(available),
+                            "window_samples": len(window),
+                            "coverage_fraction": coverage,
+                            "exceedance_count": len(exceedances),
+                            "persistence_fraction": persistence,
+                            "rule": "time_window_persistence_v1",
+                        },
+                        "interpretation": (
+                            "Persistent resource anomaly; investigate workload, "
+                            "configuration, and security context."
+                        ),
+                    })
 
-        for created_at, record_type, payload_json, previous_hash, record_hash in rows:
-            if previous_hash != expected_previous:
-                return {"valid": False, "checked_records": checked,
-                        "reason": "previous_hash_mismatch"}
+            # Count separate high-threshold runs. A below-threshold observation
+            # resets the run. A gap larger than max_gap_seconds also resets it.
+            runs: list[list[tuple[datetime, float]]] = []
+            current: list[tuple[datetime, float]] = []
+            previous_ts: datetime | None = None
 
-            body = {
-                "created_at": created_at,
-                "record_type": record_type,
-                "payload_json": payload_json,
-                "previous_hash": previous_hash,
-            }
-            calculated = hashlib.sha256(
-                _canonical(body).encode("utf-8")
-            ).hexdigest()
-            if calculated != record_hash:
-                return {"valid": False, "checked_records": checked,
-                        "reason": "record_hash_mismatch"}
+            for ts, value in measured:
+                if value is None:
+                    if current:
+                        runs.append(current)
+                        current = []
+                    previous_ts = ts
+                    continue
 
-            expected_previous = record_hash
-            checked += 1
+                gap = (
+                    (ts - previous_ts).total_seconds()
+                    if previous_ts is not None else None
+                )
 
-        return {"valid": True, "checked_records": checked}
+                if gap is not None and gap > max_gap_seconds:
+                    if current:
+                        runs.append(current)
+                    current = []
+
+                if value >= threshold:
+                    current.append((ts, value))
+                else:
+                    if current:
+                        runs.append(current)
+                    current = []
+
+                previous_ts = ts
+
+            if current:
+                runs.append(current)
+
+            repeated = [run for run in runs if run]
+            if len(repeated) >= repeated_anomaly_minimum:
+                findings.append({
+                    "category": "repeated_threshold_anomaly",
+                    "severity": "medium",
+                    "description": (
+                        f"{metric} crossed its threshold repeatedly within "
+                        "the configured observation window."
+                    ),
+                    "host": host,
+                    "evidence": {
+                        "metric": metric,
+                        "threshold": threshold,
+                        "window_seconds": window_seconds,
+                        "repeated_runs": len(repeated),
+                        "run_lengths": [len(run) for run in repeated],
+                        "max_gap_seconds": max_gap_seconds,
+                        "rule": "repeated_threshold_runs_v1",
+                    },
+                    "interpretation": (
+                        "Repeated resource anomaly; recurrence alone does not "
+                        "establish an attack."
+                    ),
+                })
+
+            # Rates use consecutive available values only when their timestamp
+            # gap is positive and no greater than max_gap_seconds.
+            rate_limit = active_rate_thresholds.get(metric)
+            if rate_limit is not None:
+                if not math.isfinite(float(rate_limit)) or rate_limit < 0:
+                    raise ValueError(
+                        f"Rate threshold for {metric} must be finite and non-negative"
+                    )
+
+                rate_events = []
+                previous: tuple[datetime, float] | None = None
+
+                for ts, value in measured:
+                    if value is None:
+                        previous = None
+                        continue
+
+                    if previous is not None:
+                        prev_ts, prev_value = previous
+                        dt = (ts - prev_ts).total_seconds()
+
+                        if 0 < dt <= max_gap_seconds:
+                            rate = (value - prev_value) / dt
+                            if abs(rate) >= rate_limit:
+                                rate_events.append({
+                                    "start": prev_ts.isoformat(),
+                                    "end": ts.isoformat(),
+                                    "rate_per_second": rate,
+                                    "elapsed_seconds": dt,
+                                })
+                    previous = (ts, value)
+
+                if rate_events:
+                    findings.append({
+                        "category": "rapid_metric_change",
+                        "severity": "medium",
+                        "description": (
+                            f"{metric} changed rapidly across one or more "
+                            "valid adjacent samples."
+                        ),
+                        "host": host,
+                        "evidence": {
+                            "metric": metric,
+                            "absolute_rate_threshold_per_second": rate_limit,
+                            "max_gap_seconds": max_gap_seconds,
+                            "events": rate_events,
+                            "rule": "time_window_rate_v1",
+                        },
+                        "interpretation": (
+                            "Rapid change may reflect legitimate workload changes, "
+                            "measurement noise, or an event needing investigation."
+                        ),
+                    })
+
+        # Explicitly surface poor data coverage. Do not label missing telemetry
+        # as normal or silently substitute values.
+        for metric in set(active_thresholds) | set(active_rate_thresholds):
+            available_count = sum(
+                _metric_value(row["metrics"], metric) is not None
+                for row in window
+            )
+            if available_count < min_samples:
+                findings.append({
+                    "category": "insufficient_window_data",
+                    "severity": "low",
+                    "description": (
+                        f"Insufficient available samples to evaluate {metric} "
+                        "reliably over the configured window."
+                    ),
+                    "host": host,
+                    "evidence": {
+                        "metric": metric,
+                        "window_seconds": window_seconds,
+                        "available_samples": available_count,
+                        "window_samples": len(window),
+                        "required_samples": min_samples,
+                        "rule": "time_window_coverage_v1",
+                    },
+                    "interpretation": "Detection coverage is limited.",
+                })
+
+    return findings
 
 
-def validate_feedback(feedback: dict[str, Any]) -> dict[str, Any]:
-    """Admit only explicitly verified, labeled feedback to a training queue."""
-    required = ("decision_id", "outcome_label", "evidence_refs", "verified")
-    missing = [key for key in required if key not in feedback]
-    if missing:
-        return {"accepted_for_training": False, "reason": "missing_fields",
-                "missing_fields": missing}
+def _robust_z(value: float, center: float, scale: float) -> float:
+    """Robust standardized distance using median absolute deviation."""
+    if scale <= 0 or not math.isfinite(scale):
+        return 0.0 if value == center else math.copysign(0.0, value - center)
+    return (value - center) / scale
 
-    allowed_labels = {"beneficial", "neutral", "harmful"}
-    if feedback["outcome_label"] not in allowed_labels:
-        return {"accepted_for_training": False, "reason": "invalid_outcome_label"}
-    if feedback["verified"] is not True:
-        return {"accepted_for_training": False, "reason": "outcome_not_verified"}
-    if not isinstance(feedback["evidence_refs"], list) or not feedback["evidence_refs"]:
-        return {"accepted_for_training": False, "reason": "evidence_refs_required"}
-    if not all(isinstance(ref, str) and ref.strip()
-               for ref in feedback["evidence_refs"]):
-        return {"accepted_for_training": False, "reason": "invalid_evidence_refs"}
-    if not isinstance(feedback["decision_id"], str) or not feedback["decision_id"]:
-        return {"accepted_for_training": False, "reason": "invalid_decision_id"}
 
-    return {
-        "accepted_for_training": True,
-        "reason": "verified_labeled_feedback",
-        "training_data_status": "eligible_pending_dataset_review",
-    }
+def detect_multivariate(
+    samples: Iterable[dict[str, Any]],
+    *,
+    baseline_samples: Iterable[dict[str, Any]] | None = None,
+    features: tuple[str, ...] = DEFAULT_METRICS,
+    minimum_features: int = 3,
+    score_threshold: float = 3.5,
+) -> list[dict[str, Any]]:
+    """Detect unusual combinations of available host metrics.
+
+    Baseline values determine per-feature median and MAD normalization. If no
+    baseline is supplied, the supplied samples are used to estimate one; this
+    is suitable for exploratory checks but not an unbiased evaluation.
+
+    Missing values are excluded per feature. A sample is scored only if at
+    least minimum_features are available. Features are not treated as
+    independent attack indicators, and the score is not a probability.
+    """
+    if minimum_features < 2 or minimum_features > len(features):
+        raise ValueError("minimum_features must be between 2 and feature count")
+    if not math.isfinite(score_threshold) or score_threshold <= 0:
+        raise ValueError("score_threshold must be finite and positive")
+
+    valid_samples = [
+        sample for sample in (_normalise_sample(x) for x in samples)
+        if sample is not None
+    ]
+    baseline_source = baseline_samples if baseline_samples is not None else valid_samples
+    valid_baseline = [
+        sample for sample in (_normalise_sample(x) for x in baseline_source)
+        if sample is not None
+    ]
+
+    if len(valid_baseline) < 3:
+        return [{
+            "category": "multivariate_baseline_unavailable",
+            "severity": "low",
+            "description": "Not enough baseline samples for robust normalization.",
+            "evidence": {
+                "baseline_samples": len(valid_baseline),
+                "required_baseline_samples": 3,
+                "rule": "multivariate_robust_score_v1",
+            },
+            "interpretation": "No multivariate anomaly conclusion was produced.",
+        }]
+
+    centers: dict[str, float] = {}
+    scales: dict[str, float] = {}
+
+    for feature in features:
+        values = [
+            value for row in valid_baseline
+            if (value := _metric_value(row["metrics"], feature)) is not None
+        ]
+        if len(values) < 3:
+            continue
+
+        center = median(values)
+        mad = median([abs(value - center) for value in values])
+        # 1.4826 scales MAD toward the standard deviation for Gaussian data.
+        robust_scale = 1.4826 * mad
+
+        # If the baseline is constant, use a tiny numerical floor only to avoid
+        # division by zero; it does not imply the feature has normal variance.
+        centers[feature] = center
+        scales[feature] = robust_scale
+
+    findings: list[dict[str, Any]] = []
+
+    for row in valid_samples:
+        available_scores: dict[str, float] = {}
+
+        for feature in features:
+            if feature not in centers:
+                continue
+            value = _metric_value(row["metrics"], feature)
+            if value is None:
+                continue
+
+            scale = scales[feature]
+            if scale == 0:
+                score = 0.0 if value == centers[feature] else score_threshold + 1.0
+            else:
+                score = _robust_z(value, centers[feature], scale)
+
+            available_scores[feature] = score
+
+        if len(available_scores) < minimum_features:
+            findings.append({
+                "category": "insufficient_multivariate_features",
+                "severity": "low",
+                "description": "Not enough available metrics for multivariate scoring.",
+                "host": row["host"],
+                "evidence": {
+                    "available_features": sorted(available_scores),
+                    "required_features": minimum_features,
+                    "rule": "multivariate_robust_score_v1",
+                },
+                "interpretation": "No multivariate anomaly conclusion was produced.",
+            })
+            continue
+
+        # Root-mean-square standardized deviation is an interpretable anomaly
+        # score. Correlated features can contribute redundantly, so this score
+        # must not be read as independent evidence or as a probability.
+        score = math.sqrt(
+            sum(value * value for value in available_scores.values())
+            / len(available_scores)
+        )
+
+        if score >= score_threshold:
+            findings.append({
+                "category": "multivariate_resource_anomaly",
+                "severity": "high" if score >= score_threshold * 1.5 else "medium",
+                "description": (
+                    "The available resource measurements jointly deviate from "
+                    "the configured baseline."
+                ),
+                "host": row["host"],
+                "evidence": {
+                    "score": score,
+                    "score_threshold": score_threshold,
+                    "feature_scores": available_scores,
+                    "feature_count": len(available_scores),
+                    "features_used": sorted(available_scores),
+                    "baseline_centers": {
+                        feature: centers[feature]
+                        for feature in available_scores
+                    },
+                    "normalization": "median_and_scaled_MAD",
+                    "rule": "multivariate_robust_score_v1",
+                },
+                "interpretation": (
+                    "Joint resource anomaly; correlated symptoms are not "
+                    "independent proof of an intrusion."
+                ),
+            })
+
+    return findings
